@@ -1,3 +1,5 @@
+# WITH ORIENTATION PATH LENGTH
+
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
@@ -8,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import math
+import numpy as np
 
 # ============ Configuration ============
 TIMER_RATE_HZ = 100        # Sampling rate (Hz)
@@ -16,6 +19,38 @@ MAX_TIME_SEC = 120        # Time limit (seconds)
 WINDOW_ALPHA = 0.85       # Transparency (0.0-1.0)
 # =======================================
 
+
+# ============ Quaternion Math Functions ============
+
+def quaternion_conjugate(q):
+    """Return conjugate (inverse for unit quaternions) of quaternion [x, y, z, w]"""
+    return [-q[0], -q[1], -q[2], q[3]]
+
+def quaternion_multiply(q1, q2):
+    """Multiply two quaternions: q1 * q2"""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    
+    return [
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2
+    ]
+
+def quaternion_to_angle(q):
+    """
+    Extract rotation angle θ from quaternion q = [x, y, z, w]
+    Following equation (6): θ = 2 * arccos(w)
+    w is the scalar part (q4 in the paper, but index 3 in [x,y,z,w])
+    """
+    w = q[3]
+    # Clamp to [-1, 1] to avoid numerical errors in arccos
+    w = max(-1.0, min(1.0, w))
+    theta = 2.0 * math.acos(w)
+    return theta
+
+
 class TimerGUI:
     def __init__(self, max_time=120):
         self.max_time = max_time
@@ -23,6 +58,12 @@ class TimerGUI:
         self.path_length_psm1 = 0.0  # PSM1 path in millimeters
         self.path_length_psm2 = 0.0  # PSM2 path in millimeters
         self.is_running = False
+
+        # NEW: Orientation metrics
+        self.angular_displacement_psm1 = 0.0  # A (total angle change)
+        self.angular_displacement_psm2 = 0.0
+        self.orientation_rate_psm1 = 0.0  # C (average rate)
+        self.orientation_rate_psm2 = 0.0
         
         # Window size
         # self.width = 350
@@ -233,6 +274,18 @@ class TaskTimerNode(Node):
         self.last_position_psm2 = None
         self.pose_sample_count_psm1 = 0
         self.pose_sample_count_psm2 = 0
+
+        # NEW: For orientation tracking
+        self.last_orientation_psm1 = None
+        self.last_orientation_psm2 = None
+        self.last_time_psm1 = None
+        self.last_time_psm2 = None
+        self.angle_sum_psm1 = 0.0
+        self.angle_sum_psm2 = 0.0
+        self.angle_time_sum_psm1 = 0.0  # Σ(θ/Δt)
+        self.angle_time_sum_psm2 = 0.0
+        self.orientation_sample_count_psm1 = 0
+        self.orientation_sample_count_psm2 = 0
         
         # Subscribe to teleop state
         self.teleop_sub = self.create_subscription(
@@ -263,7 +316,7 @@ class TaskTimerNode(Node):
             10)
         
         self.timer = self.create_timer(TIMER_INTERVAL, self.update_timer)
-        self.get_logger().info('Task timer GUI ready (dual PSM). Press MONO pedal to start timing.')
+        self.get_logger().info('Task timer GUI ready (dual PSM). Turn on the Tele operation & Press MONO pedal to start timing.')
 
     def teleop_callback(self, msg):
         old_state = self.teleop_enabled
@@ -275,17 +328,61 @@ class TaskTimerNode(Node):
             path1_mm = self.gui.path_length_psm1 * 1000
             path2_mm = self.gui.path_length_psm2 * 1000
             total_mm = path1_mm + path2_mm
+
+            # NEW: Log orientation metrics
+            ang_disp1_deg = math.degrees(self.gui.angular_displacement_psm1)
+            ang_disp2_deg = math.degrees(self.gui.angular_displacement_psm2)
+            rate1_deg = math.degrees(self.gui.orientation_rate_psm1)
+            rate2_deg = math.degrees(self.gui.orientation_rate_psm2)
+
+            # Keep metrics in radians
+            ang_disp1_rad = self.gui.angular_displacement_psm1
+            ang_disp2_rad = self.gui.angular_displacement_psm2
+            rate1_rad = self.gui.orientation_rate_psm1
+            rate2_rad = self.gui.orientation_rate_psm2
+
             if duration > 0:
-                self.get_logger().info(f'✅ Trial complete. Time: {duration:.2f}s')
-                self.get_logger().info(f'   PSM1 path: {path1_mm:.1f} mm ({self.pose_sample_count_psm1} samples)')
-                self.get_logger().info(f'   PSM2 path: {path2_mm:.1f} mm ({self.pose_sample_count_psm2} samples)')
-                self.get_logger().info(f'   Total path: {total_mm:.1f} mm')
+                self.get_logger().info('='*60)
+                self.get_logger().info('✅ TRIAL COMPLETE')
+                self.get_logger().info('='*60)
+                self.get_logger().info(f'Duration: {duration:.2f} s')
+                self.get_logger().info(f'')
+                self.get_logger().info(f'Path Length:')
+                self.get_logger().info(f'  PSM1 (R): {path1_mm:.1f} mm')
+                self.get_logger().info(f'  PSM2 (L): {path2_mm:.1f} mm')
+                self.get_logger().info(f'  Total:    {total_mm:.1f} mm')
+                self.get_logger().info(f'')
+                self.get_logger().info(f'Angular Displacement:')
+                self.get_logger().info(f'  PSM1 (R): {ang_disp1_deg:.1f}°')
+                self.get_logger().info(f'  PSM2 (L): {ang_disp2_deg:.1f}°')
+                self.get_logger().info(f'')
+                # self.get_logger().info(f'Average Orientation Rate:')
+                # self.get_logger().info(f'  PSM1 (R): {rate1_deg:.2f} °/s')
+                # self.get_logger().info(f'  PSM2 (L): {rate2_deg:.2f} °/s')
+                self.get_logger().info(f'Average Orientation Rate:')
+                self.get_logger().info(f'  PSM1 (R): {rate1_rad:.4f} rad/s')
+                self.get_logger().info(f'  PSM2 (L): {rate2_rad:.4f} rad/s')
+                self.get_logger().info('='*60)
+                
+                # Reset everything
                 self.gui.reset()
                 self.sample_count = 0
                 self.pose_sample_count_psm1 = 0
                 self.pose_sample_count_psm2 = 0
                 self.last_position_psm1 = None
                 self.last_position_psm2 = None
+
+                # NEW: Reset orientation tracking
+                self.last_orientation_psm1 = None
+                self.last_orientation_psm2 = None
+                self.last_time_psm1 = None
+                self.last_time_psm2 = None
+                self.angle_sum_psm1 = 0.0
+                self.angle_sum_psm2 = 0.0
+                self.angle_time_sum_psm1 = 0.0
+                self.angle_time_sum_psm2 = 0.0
+                self.orientation_sample_count_psm1 = 0
+                self.orientation_sample_count_psm2 = 0
         
         self.update_state()
     
@@ -302,10 +399,17 @@ class TaskTimerNode(Node):
         """PSM1 pose callback at ~198 Hz"""
         if not self.gui.is_running:
             self.last_position_psm1 = None
+            self.last_orientation_psm1 = None
+            self.last_time_psm1 = None
             return
         
         current_pos = msg.pose.position
         current_position = [current_pos.x, current_pos.y, current_pos.z]
+
+        current_ori = msg.pose.orientation
+        current_orientation = [current_ori.x, current_ori.y, current_ori.z, current_ori.w]
+        
+        current_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
         if self.last_position_psm1 is not None:
             dx = current_position[0] - self.last_position_psm1[0]
@@ -316,17 +420,55 @@ class TaskTimerNode(Node):
             self.gui.add_path_psm1(distance)
             self.pose_sample_count_psm1 += 1
         
+        # Orientation calculation (NEW)
+        if self.last_orientation_psm1 is not None and self.last_time_psm1 is not None:
+            # Q_{j,j+1} = Q_{j+1} * Q_j^{-1}
+            q_j_inv = quaternion_conjugate(self.last_orientation_psm1)
+            q_diff = quaternion_multiply(current_orientation, q_j_inv)
+            
+            # Extract angle θ
+            theta = quaternion_to_angle(q_diff)
+            
+            # Time difference
+            dt = current_time - self.last_time_psm1
+            
+            if dt > 0:
+                # Accumulate angular displacement (equation 7)
+                self.angle_sum_psm1 += theta
+                
+                # Accumulate for rate calculation (equation 8)
+                self.angle_time_sum_psm1 += theta / dt
+                
+                self.orientation_sample_count_psm1 += 1
+                
+                # Update GUI metrics
+                self.gui.angular_displacement_psm1 = self.angle_sum_psm1
+                
+                if self.orientation_sample_count_psm1 > 0:
+                    self.gui.orientation_rate_psm1 = self.angle_time_sum_psm1 / self.orientation_sample_count_psm1
+        
+        # Update last values
         self.last_position_psm1 = current_position
+        self.last_orientation_psm1 = current_orientation
+        self.last_time_psm1 = current_time
     
     def pose_callback_psm2(self, msg):
         """PSM2 pose callback at ~198 Hz"""
         if not self.gui.is_running:
             self.last_position_psm2 = None
+            self.last_orientation_psm2 = None
+            self.last_time_psm2 = None
             return
         
         current_pos = msg.pose.position
         current_position = [current_pos.x, current_pos.y, current_pos.z]
         
+        current_ori = msg.pose.orientation
+        current_orientation = [current_ori.x, current_ori.y, current_ori.z, current_ori.w]
+        
+        current_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        
+        # Path length calculation (existing)
         if self.last_position_psm2 is not None:
             dx = current_position[0] - self.last_position_psm2[0]
             dy = current_position[1] - self.last_position_psm2[1]
@@ -336,7 +478,37 @@ class TaskTimerNode(Node):
             self.gui.add_path_psm2(distance)
             self.pose_sample_count_psm2 += 1
         
+        # Orientation calculation (NEW)
+        if self.last_orientation_psm2 is not None and self.last_time_psm2 is not None:
+            # Q_{j,j+1} = Q_{j+1} * Q_j^{-1}
+            q_j_inv = quaternion_conjugate(self.last_orientation_psm2)
+            q_diff = quaternion_multiply(current_orientation, q_j_inv)
+            
+            # Extract angle θ
+            theta = quaternion_to_angle(q_diff)
+            
+            # Time difference
+            dt = current_time - self.last_time_psm2
+            
+            if dt > 0:
+                # Accumulate angular displacement (equation 7)
+                self.angle_sum_psm2 += theta
+                
+                # Accumulate for rate calculation (equation 8)
+                self.angle_time_sum_psm2 += theta / dt
+                
+                self.orientation_sample_count_psm2 += 1
+                
+                # Update GUI metrics
+                self.gui.angular_displacement_psm2 = self.angle_sum_psm2
+                
+                if self.orientation_sample_count_psm2 > 0:
+                    self.gui.orientation_rate_psm2 = self.angle_time_sum_psm2 / self.orientation_sample_count_psm2
+        
+        # Update last values
         self.last_position_psm2 = current_position
+        self.last_orientation_psm2 = current_orientation
+        self.last_time_psm2 = current_time
     
     def update_state(self):
         should_run = self.teleop_enabled and self.mono_pressed
@@ -373,9 +545,25 @@ class TaskTimerNode(Node):
                     path1_mm = self.gui.path_length_psm1 * 1000
                     path2_mm = self.gui.path_length_psm2 * 1000
                     total_mm = path1_mm + path2_mm
+                    
+                    # Convert orientation metrics to degrees
+                    ang_disp1_deg = math.degrees(self.gui.angular_displacement_psm1)
+                    ang_disp2_deg = math.degrees(self.gui.angular_displacement_psm2)
+                    rate1_deg = math.degrees(self.gui.orientation_rate_psm1)
+                    rate2_deg = math.degrees(self.gui.orientation_rate_psm2)
+                    
                     self.get_logger().info(
-                        f'Recording @ {self.current_hz:.1f} Hz | Time: {self.gui.elapsed:.1f}s | '
-                        f'PSM (R): {path1_mm:.1f}mm | PSM (L): {path2_mm:.1f}mm | Total: {total_mm:.1f}mm'
+                        f'Recording @ {self.current_hz:.1f} Hz | Time: {self.gui.elapsed:.1f}s'
+                    )
+                    self.get_logger().info(
+                        f'  Path: R={path1_mm:.1f}mm L={path2_mm:.1f}mm Total={total_mm:.1f}mm'
+                    )
+                    self.get_logger().info(
+                        f'  Orient: R={ang_disp1_deg:.1f}° ({rate1_deg:.1f}°/s) | L={ang_disp2_deg:.1f}° ({rate2_deg:.1f}°/s)'
+                    )
+                    # show in radians as well
+                    self.get_logger().info(
+                        f'  Orient (rad): R={self.gui.angular_displacement_psm1:.4f} rad ({self.gui.orientation_rate_psm1:.4f} rad/s) | L={self.gui.angular_displacement_psm2:.4f} rad ({self.gui.orientation_rate_psm2:.4f} rad/s)'
                     )
                     
             self.last_time = current_time

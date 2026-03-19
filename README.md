@@ -14,7 +14,7 @@ Collection of ROS 2 tools for measuring task performance metrics on the da Vinci
 ## Scripts
 
 ### `task_timer_gui`
-Floating semi-transparent timer window that tracks time when MONO pedal is pressed.
+Floating semi-transparent timer window that tracks time and total path length when MONO pedal is pressed.
 
 **Features:**
 - Dual-window display for stereo endoscope viewing
@@ -25,3 +25,4 @@ Floating semi-transparent timer window that tracks time when MONO pedal is press
 **Usage:**
 ```bash
 ros2 run dvrk_shujiro task_timer_gui
+

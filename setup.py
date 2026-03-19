@@ -27,6 +27,7 @@ setup(
             'task_timer = dvrk_shujiro.task_timer:main',
             'task_timer_bar = dvrk_shujiro.task_timer_bar:main',
             'task_timer_gui = dvrk_shujiro.task_timer_gui:main',
+            'task_timer_path_gui = dvrk_shujiro.task_timer_path_gui:main', 
         ],
     },
 )
