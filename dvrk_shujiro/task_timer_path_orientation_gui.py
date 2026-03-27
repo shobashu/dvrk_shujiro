@@ -13,7 +13,7 @@ import math
 import numpy as np
 
 # ============ Configuration ============
-TIMER_RATE_HZ = 100        # Sampling rate (Hz)
+TIMER_RATE_HZ = 200        # Sampling rate (Hz)
 TIMER_INTERVAL = 1.0 / TIMER_RATE_HZ
 MAX_TIME_SEC = 120        # Time limit (seconds)
 WINDOW_ALPHA = 0.85       # Transparency (0.0-1.0)
