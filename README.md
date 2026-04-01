@@ -1,5 +1,4 @@
 ```bash
-cat > ~/dvrk_shujiro_ws/src/dvrk_shujiro/README.md << 'EOFREADME'
 # dVRK Data Collection Tools
 
 **Author:** Shujiro  
