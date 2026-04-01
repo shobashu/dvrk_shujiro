@@ -1,4 +1,3 @@
-```bash
 # dVRK Data Collection Tools
 
 **Author:** Shujiro  
