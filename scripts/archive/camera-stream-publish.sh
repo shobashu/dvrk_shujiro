@@ -63,6 +63,7 @@ ros2 run gscam gscam_node --ros-args \
   -p frame_id:=left_camera_frame &
 LEFT_CAM_PID=$!
 
+
 sleep 3
 
 echo ""
@@ -81,3 +82,4 @@ echo "Press Ctrl+C to stop cameras"
 
 # Only wait for cameras, NOT viewers
 wait $RIGHT_CAM_PID $LEFT_CAM_PID
+
