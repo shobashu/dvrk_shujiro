@@ -1,3 +1,8 @@
+# Convert compressed ROS2 bag to MP4 video
+# Usage: ./compressed-bag-to-mp4.sh <recording_name> [left|right|both]
+# Example: ./compressed-bag-to-mp4.sh trial_01_compressed both  
+
+
 #!/usr/bin/env bash
 
 if [ -z "$1" ]; then
@@ -52,9 +57,10 @@ class CompressedImageExtractor(Node):
         print(f"Extracting from {topic} to {output_dir}")
     
     def callback(self, msg):
-        filename = os.path.join(self.output_dir, f"frame_{self.frame_count:06d}.jpg")
+        # Use timestamp instead of counter
+        timestamp = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
+        filename = os.path.join(self.output_dir, f"frame_{timestamp}.jpg")
         
-        # Write JPEG data directly
         with open(filename, 'wb') as f:
             f.write(msg.data)
         
@@ -112,7 +118,7 @@ convert_camera() {
     
     # Play bag in background
     echo "Playing bag and extracting frames..."
-    ros2 bag play $BAG_DIR --topics $TOPIC --rate 2.0 &
+    ros2 bag play $BAG_DIR --topics $TOPIC --rate 1.0 &
     BAG_PID=$!
     
     sleep 2

@@ -1,3 +1,11 @@
+# Start Camera Streaming
+# ./camera-stream-compressed-transport.sh
+
+# View cameras (new terminal)
+# source /opt/ros/jazzy/setup.bash
+# source ~/ros2_ws/install/setup.bash
+# rqt
+
 #!/usr/bin/env bash
 
 source /opt/ros/jazzy/setup.bash
@@ -23,7 +31,7 @@ ros2 run gscam gscam_node --ros-args \
   -r __node:=gscam_right \
   -r camera/image_raw:=camera_right/image_raw \
   -r camera/camera_info:=camera_right/camera_info \
-  -p gscam_config:="decklinkvideosrc device-number=0 ! videoconvert" \
+  -p gscam_config:="decklinkvideosrc device-number=0 ! videoconvert ! videobalance brightness=0.1 contrast=1.2 saturation=1.5 hue=0.0" \
   -p camera_name:=camera_right \
   -p frame_id:=camera &
 RIGHT_CAM_PID=$!
@@ -78,9 +86,9 @@ sleep 2
 LEFT_COMP_RATE=$(timeout 3 ros2 topic hz /camera_left/compressed 2>/dev/null | grep "average rate" | awk '{print $3}')
 
 if [ ! -z "$LEFT_COMP_RATE" ]; then
-    echo "  ✓ Compressed stream: ${LEFT_COMP_RATE} Hz"
+    echo "  Compressed stream: ${LEFT_COMP_RATE} Hz"
 else
-    echo "  ⧗ Compression starting..."
+    echo "  Compression starting..."
 fi
 
 echo ""
