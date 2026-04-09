@@ -23,6 +23,7 @@ int currPin = 0;
 bool loopRun = false;
 unsigned long startTime;
 
+// runs once when Arduino powers on 
 void setup() {
   // put your setup code here, to run once:
   //
@@ -47,6 +48,7 @@ void setup() {
   Serial.begin(9600);
 }
 
+// turns off all the LEDs
 void resetLEDs(){
   for(int i = 0; i < 8; i++){
       digitalWrite(pins[i][0], LOW);
@@ -54,6 +56,7 @@ void resetLEDs(){
   }
 }
 
+// turns on the white LED for a given pin number (1-8)
 void turnOnWhite(int pinNum){
   if(digitalRead(pins[pinNum - 1][1]) == 1){
     return;
@@ -61,6 +64,8 @@ void turnOnWhite(int pinNum){
   digitalWrite(pins[pinNum - 1][1], HIGH);
 }
 
+
+// turns on the blue LED for a given pin number (1-8)
 void turnOnBlue(int pinNum){
   if(digitalRead(pins[pinNum - 1][0]) == 1){
     return;
@@ -68,12 +73,14 @@ void turnOnBlue(int pinNum){
   digitalWrite(pins[pinNum - 1][0], HIGH);
 }
 
+// Wait for cylinder to be LIFTED from the center peg
 void waitUntilPinOff(int centerPinIndex){
   while(digitalRead(inputPinsForCenter[centerPinIndex]) == 1){
     //Serial.print('+');
     //do nothing.
   }
   bool val = false;
+  // adds +48
   Serial.print("CENTER ");
   Serial.print(centerPinIndex + '0');
   Serial.print(",LIFTED,");
@@ -82,6 +89,7 @@ void waitUntilPinOff(int centerPinIndex){
   Serial.println(val);
 }
 
+// Detect whihc center peg was touched first
 //specifically for change in any configuration, from high to low.
 int waitUntilChangeCenter(){
   //record the initial configuration of each of the pins
@@ -103,6 +111,7 @@ int waitUntilChangeCenter(){
     for(int k = 0; k < 4; k++){
       if(initialConfig[k] == 0){ continue; } //we only care about pegs that go from high to low.
       if(initialConfig[k] != digitalRead(inputPinsForCenter[k])){
+
         stateChanged = true;
         pinChangedIndex = k;
         break;
@@ -112,6 +121,7 @@ int waitUntilChangeCenter(){
   return pinChangedIndex;
 }
 
+// Wait for cylinder to be PLACED on the target peg
 void waitUntilPinOn(int inputPinNum){
   while (Serial.available() > 0) {
     Serial.read(); //flush pre-existing buffer
@@ -136,6 +146,7 @@ void waitUntilPinOn(int inputPinNum){
   Serial.println(manualIntervention);
 }
 
+// Wait for cylinder to be PLACED back at the center
 void waitUntilPinOnCenter(int inputPinIndex){
   while (Serial.available() > 0) {
     Serial.read(); //flush pre-existing buffer
@@ -165,7 +176,7 @@ int SEQUENCE_SIZE = 3; //@MK: change this to however long you want your sequence
 int pinIndexSequence[3][2] = {{1, 0}, {2, 1}, {3, 0}}; //@MK; add sequences to this list. Also change the '3' in 'pinIndexSequence[3][2]' to whatever size you want the sequence
 //each array is {pinIndex, color}, where color is 0 if blue, and 1 if white.
 
-
+// run a fixed predefined sequence of trials
 void startSequence(){
   //input tells us which pin to look out for!
   for(int i = 0; i < SEQUENCE_SIZE; i++){
@@ -181,7 +192,15 @@ void startSequence(){
   }
 }
 
-
+// the main trial logic
+// 1 Both target LEDs light up blue → cue to pick up
+// 2 Wait for cylinder to be lifted from center
+// 3 Reset LEDs, randomly pick left or right target
+// 4 Light it up blue or white based on whiteBlueAlternations sequence
+// 5 Wait for cylinder to be placed on target
+// 6 Wait for cylinder to be returned to center
+// 7 Both targets light up white for 2 seconds → success feedback
+// 8 Reset LEDs, trial over
 void runOneTrialSamePeg(int centerPinIndex){
   turnOnBlue(indexPairings[centerPinIndex][0]);
   turnOnBlue(indexPairings[centerPinIndex][1]); //turn them both on!
@@ -211,6 +230,7 @@ void runOneTrialSamePeg(int centerPinIndex){
   resetLEDs();
 }
 
+// Alternative mode triggered by picking up any piece
 void runSequences(){
   int pinChangedIndex = waitUntilChangeCenter();
     //Serial.println("Game piece lifted from start!");
@@ -224,7 +244,7 @@ void runSequences(){
     resetLEDs();
 }
 
-
+// runs the 50 trials
 void loop() {
   // put your main code here, to run repeatedly:
   if(!loopRun){

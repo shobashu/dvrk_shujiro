@@ -31,3 +31,8 @@ TOPIC_TELEOP_ENABLED = '/console/teleop/enabled'
 TOPIC_OPERATOR_PRESENT = '/console/operator_present'
 TOPIC_PSM1_POSE = '/PSM1/measured_cp'
 TOPIC_PSM2_POSE = '/PSM2/measured_cp'
+
+# ── Arduino settings ──────────────────────────────────────────────────────────
+ARDUINO_PORT = '/dev/ttyACM1'   
+ARDUINO_BAUD = 9600
+ARDUINO_CSV  = "arduino_data.csv"
