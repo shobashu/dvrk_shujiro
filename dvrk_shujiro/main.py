@@ -39,39 +39,14 @@ def main(args=None):
     # ── ROS node ───────────────────────────────────────────────────
     node = TaskTimerNode(gui)
 
-    # ── Arduino callback ──────────────────────────────────────────────────────
-    def on_arduino_event(event):
-        """
-        Called by ArduinoReader every time a valid event arrives.
-        Runs in the Arduino background thread.
-
-        event.location_type : "CENTER" or "PEG"
-        event.event         : "LIFTED" or "PLACED"
-        event.pin_index     : decoded index (raw number - 48)
-        event.arduino_ms    : milliseconds since Arduino powered on
-        """
-        if event.location_type == "CENTER" and event.event == "LIFTED":
-            print(f"[Main] Cylinder lifted from center {event.pin_index}")
-            popup.show_threadsafe()
-
-        elif event.location_type == "PEG" and event.event == "PLACED":
-            print(f"[Main] Cylinder placed on peg {event.pin_index}")
-            popup.complete_threadsafe()
-
     # ── Arduino reader ────────────────────────────────────────────────────────
-    arduino = ArduinoReader(port=ARDUINO_PORT, callback=on_arduino_event)
+    arduino = ArduinoReader(port=ARDUINO_PORT, callback=popup.on_arduino_event)
     arduino.start()
+
+    # ── Start ROS spinning in background thread ─────────────────────────────────────────────
+    node.start_spinning()  
     
-    # ── ROS spinning in background thread ──────────────────────────
-    def spin_node():
-        try:
-            rclpy.spin(node)
-        except Exception as e:
-            print(f"ROS error: {e}")
-    
-    ros_thread = threading.Thread(target=spin_node, daemon=True)
-    ros_thread.start()
-    
+
     # Run GUI in main thread (blocking)
     try:
         print("GUI started. Press MONO pedal to begin.")

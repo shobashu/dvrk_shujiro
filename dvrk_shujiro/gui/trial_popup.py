@@ -266,3 +266,20 @@ class TrialPopup:
         s = int(seconds % 60)
         t = int((seconds % 1) * 10)
         return f"{m:02d}:{s:02d}.{t}"
+    
+    def on_arduino_event(self, event):
+        """
+        Callback passed to ArduinoReader.
+        Called from Arduino background thread on every valid event.
+
+        event.location_type : "CENTER" or "PEG"
+        event.event         : "LIFTED" or "PLACED"
+        event.pin_index     : decoded index (raw number - 48)
+        """
+        if event.location_type == "CENTER" and event.event == "LIFTED":
+            print(f"[Arduino] Cylinder lifted from center {event.pin_index}")
+            self.show_threadsafe()
+
+        elif event.location_type == "PEG" and event.event == "PLACED":
+            print(f"[Arduino] Cylinder placed on peg {event.pin_index}")
+            self.complete_threadsafe()

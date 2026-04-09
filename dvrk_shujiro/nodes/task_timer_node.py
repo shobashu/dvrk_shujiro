@@ -193,3 +193,15 @@ class TaskTimerNode(Node):
         self.sample_count = 0
         self.tracker_psm1.reset()
         self.tracker_psm2.reset()
+
+    def start_spinning(self):
+        """Start ROS spinning in a background thread."""
+        import threading
+        thread = threading.Thread(target=self._spin, daemon=True)
+        thread.start()
+
+    def _spin(self):
+        try:
+            rclpy.spin(self)
+        except Exception as e:
+            print(f"ROS error: {e}")
