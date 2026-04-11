@@ -272,14 +272,13 @@ class TrialPopup:
         Callback passed to ArduinoReader.
         Called from Arduino background thread on every valid event.
 
-        event.location_type : "CENTER" or "PEG"
-        event.event         : "LIFTED" or "PLACED"
-        event.pin_index     : decoded index (raw number - 48)
+        event.event_type : "LIFTED" → cylinder picked up, start timer
+                        "DATA"   → trial complete, stop timer
         """
-        if event.location_type == "CENTER" and event.event == "LIFTED":
-            print(f"[Arduino] Cylinder lifted from center {event.pin_index}")
+        if event.event_type == "LIFTED":
+            print(f"[Popup] Cylinder lifted — starting timer")
             self.show_threadsafe()
 
-        elif event.location_type == "PEG" and event.event == "PLACED":
-            print(f"[Arduino] Cylinder placed on peg {event.pin_index}")
+        elif event.event_type == "DATA":
+            print(f"[Popup] Trial {event.trial} complete — peg {event.target_peg} {event.color}")
             self.complete_threadsafe()

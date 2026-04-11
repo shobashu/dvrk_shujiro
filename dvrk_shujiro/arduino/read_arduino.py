@@ -1,111 +1,126 @@
 """
 Arduino Reader
 --------------
-Reads serial data from the Arduino and saves it to a CSV file.
-Can be run standalone (original behaviour) OR imported by main.py.
+Reads serial data from the Arduino and saves trial data to a CSV file.
+Can be run standalone OR imported by main.py.
 
 When imported, use the ArduinoReader class:
     from .arduino.read_arduino import ArduinoReader
     reader = ArduinoReader(callback=my_function)
     reader.start()
 
-When run standalone (original behaviour):
+When run standalone:
     python3 read_arduino.py
 
-Message format received from Arduino:
-    CENTER 51,LIFTED,7138,0
-    PEG 52,PLACED,76191,0
+Messages received from Arduino:
+    --- System Ready ---        → plain text, printed to terminal, ignored
+    SYNC,7138                   → time sync pulse sent once at experiment start
+    LIFTED                      → cylinder lifted in real time (triggers popup)
+    DATA,1,5,White,7138,9200,15400  → full trial result sent after placement
+    2 second pause...           → plain text, printed to terminal, ignored
 
-CSV format saved (one extra column added by Python):
-    CENTER 51,LIFTED,7138,0,1773436001.566
-    └─location─┘ └─event─┘ └─ms─┘ └manual┘ └─timestamp─┘
+CSV format saved (one row per trial):
+    Trial, Target_Peg, Target_Color, Unix_Cue_Time, Unix_Lift_Time, Unix_Place_Time
 """
 
 import serial
 import csv
 import threading
-from datetime import datetime, timedelta
+import time
 
 # ── Settings (imported from config when used inside the package) ───────────────
 try:
     from ..config import ARDUINO_PORT as PORT, ARDUINO_BAUD as BAUD, ARDUINO_CSV as FILENAME
 except ImportError:
     # Fallback when running standalone
-    PORT     = '/dev/ttyACM1'   # Change to your Arduino port
+    PORT     = '/dev/ttyACM0'
     BAUD     = 9600
-    FILENAME = "arduino_data.csv"
+    FILENAME = "experiment_data.csv"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ArduinoEvent — one parsed line from the Arduino
+# ArduinoEvent — one parsed event from the Arduino
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ArduinoEvent:
     """
     Represents one event received from the Arduino.
 
-    Attributes:
-        location_type  "CENTER" or "PEG"
-        pin_raw        raw number from Arduino message (e.g. 51)
-        pin_index      decoded index (pin_raw - 48), e.g. 51 → 3
-        event          "LIFTED" or "PLACED"
-        arduino_ms     milliseconds since Arduino powered on
-        manual         0 = normal event, 1 = manually triggered
-        timestamp      Unix wall-clock time (float)
+    Two types of events:
+
+    1. LIFTED — real time signal when cylinder is picked up
+        event_type  = "LIFTED"
+        trial       = None
+        target_peg  = None
+        color       = None
+        unix_cue    = None
+        unix_lift   = None
+        unix_place  = None
+
+    2. DATA — full trial result sent after placement
+        event_type  = "DATA"
+        trial       = trial number (int)
+        target_peg  = target peg index (int, 1-8)
+        color       = "Blue" or "White"
+        unix_cue    = Unix time of cue (float)
+        unix_lift   = Unix time of lift (float)
+        unix_place  = Unix time of placement (float)
     """
 
-    def __init__(self, location_type, pin_raw, event, arduino_ms, manual, timestamp):
-        self.location_type = location_type
-        self.pin_raw       = int(pin_raw)
-        self.pin_index     = int(pin_raw) - 48   # Arduino adds ASCII offset of 48
-        self.event         = event
-        self.arduino_ms    = int(arduino_ms)
-        self.manual        = int(manual)
-        self.timestamp     = float(timestamp)
+    def __init__(self, event_type, trial=None, target_peg=None, color=None,
+                 unix_cue=None, unix_lift=None, unix_place=None):
+        self.event_type = event_type    # "LIFTED" or "DATA"
+        self.trial      = trial
+        self.target_peg = target_peg
+        self.color      = color
+        self.unix_cue   = unix_cue
+        self.unix_lift  = unix_lift
+        self.unix_place = unix_place
 
     def __repr__(self):
-        return (f"ArduinoEvent({self.location_type} {self.pin_index}"
-                f" — {self.event} at {self.arduino_ms}ms)")
+        if self.event_type == "LIFTED":
+            return "ArduinoEvent(LIFTED)"
+        return (f"ArduinoEvent(DATA trial={self.trial} peg={self.target_peg}"
+                f" color={self.color})")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ArduinoReader — class wrapper around the original read_from_arduino logic
+# ArduinoReader
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ArduinoReader:
     """
-    Wraps the original Arduino reading logic in a class so it can be
-    started by main.py alongside the ROS node and GUI.
+    Reads Arduino serial data in a background thread.
+    Parses each line and calls callback(event) for LIFTED and DATA events.
 
-    Usage inside main.py:
-        reader = ArduinoReader(callback=on_arduino_event)
+    Usage:
+        reader = ArduinoReader(callback=my_function)
         reader.start()
-
-    The callback receives one ArduinoEvent every time a valid line arrives.
+        reader.send_command('s')   # start experiment
     """
 
     def __init__(self, callback=None, port=PORT, baud=BAUD, filename=FILENAME):
         self.port     = port
         self.baud     = baud
         self.filename = filename
-        self.callback = callback        # called with ArduinoEvent on each event
+        self.callback = callback
 
-        # Serial connection (same as original)
-        self.ser = None
+        self.ser      = None
+        self._thread  = None
 
-        # Time sync variables (same logic as original read_from_arduino)
-        self.initialized        = False
-        self.startTime          = datetime.now()
-        self.initialMilliSeconds = 0
+        # Time sync — set when SYNC message arrives from Arduino
+        self._python_sync_time    = 0
+        self._arduino_sync_millis = 0
 
-        self._thread = None
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self):
         """Open serial connection and start background reading thread."""
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+            time.sleep(2)   # give Arduino time to reset after connection
             self._thread = threading.Thread(
-                target=self._read_from_arduino,
+                target=self._read_loop,
                 daemon=True,
                 name="ArduinoReader"
             )
@@ -121,101 +136,135 @@ class ArduinoReader:
         print("[Arduino] Connection closed.")
 
     def send_command(self, cmd):
-        """Send a manual command to Arduino (triggers manualIntervention flag)."""
+        """
+        Send a command to Arduino.
+        's' = start experiment
+        'q' = abort experiment
+        """
         if self.ser and self.ser.is_open:
-            self.ser.write((cmd + '\n').encode('utf-8'))
+            self.ser.write(cmd.encode('utf-8'))
 
-    # ── Internal — original read_from_arduino logic, now inside the class ─────
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _read_from_arduino(self):
-        """
-        Background thread — reads lines from Arduino, saves to CSV.
-        This is the same logic as the original read_from_arduino() function,
-        with one addition: calls self.callback(event) on each valid line.
-        """
+    def _read_loop(self):
+        """Background thread — reads lines from Arduino and processes them."""
         with open(self.filename, mode='a', newline='') as f:
             writer = csv.writer(f)
+
+            # Write CSV header if file is new/empty
+            f.seek(0, 2)    # seek to end
+            if f.tell() == 0:
+                writer.writerow([
+                    'Trial', 'Target_Peg', 'Target_Color',
+                    'Unix_Cue_Time', 'Unix_Lift_Time', 'Unix_Place_Time'
+                ])
+
             print(f"--- Logging started. Saving to {self.filename} ---")
 
             while True:
                 if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8').strip()
-                    if line:
-                        line = line.split(',')
+                    try:
+                        line = self.ser.readline().decode('utf-8').strip()
+                    except Exception as e:
+                        print(f"[Arduino] Read error: {e}")
+                        continue
 
-                        # ── Time sync (original logic) ────────────────────────
-                        if not self.initialized:
-                            self.startTime           = datetime.now()
-                            currTime                 = self.startTime
-                            self.initialized         = True
-                            self.initialMilliSeconds = int(line[2])
-                        else:
-                            currTime = self.startTime + timedelta(
-                                milliseconds=(int(line[2]) - self.initialMilliSeconds)
-                            )
+                    if not line:
+                        continue
 
-                        line.append(currTime.timestamp())
+                    # ── SYNC — record time reference ──────────────────────────
+                    if line.startswith("SYNC,"):
+                        parts = line.split(",")
+                        self._arduino_sync_millis = int(parts[1])
+                        self._python_sync_time    = time.time()
+                        print(f"[Arduino] Time sync received at {self._python_sync_time:.3f}")
 
-                        # Print to terminal (original behaviour)
-                        print(f"\n[Arduino]: {line}")
-
-                        # Save to CSV (original behaviour)
-                        writer.writerow(line)
-                        f.flush()   # write to disk immediately
-
-                        # ── New: parse and fire callback ──────────────────────
+                    # ── LIFTED — real time lift signal ────────────────────────
+                    elif line == "LIFTED":
+                        print("[Arduino] Cylinder LIFTED")
                         if self.callback:
-                            event = self._parse(line)
-                            if event:
+                            self.callback(ArduinoEvent(event_type="LIFTED"))
+
+                    # ── DATA — full trial result ──────────────────────────────
+                    elif line.startswith("DATA,"):
+                        event = self._parse_data(line)
+                        if event:
+                            # Save to CSV
+                            writer.writerow([
+                                event.trial,
+                                event.target_peg,
+                                event.color,
+                                f"{event.unix_cue:.3f}",
+                                f"{event.unix_lift:.3f}",
+                                f"{event.unix_place:.3f}"
+                            ])
+                            f.flush()
+                            print(f"[CSV] Trial {event.trial} saved — "
+                                  f"peg {event.target_peg} {event.color}")
+                            if self.callback:
                                 self.callback(event)
 
-    def _parse(self, line):
-        """
-        Parse a split CSV line into an ArduinoEvent.
-        Returns None if the line is not a recognised event.
+                    # ── Everything else — print to terminal ───────────────────
+                    else:
+                        print(f"[Arduino] {line}")
 
-        line is already split, e.g.:
-            ['CENTER 51', 'LIFTED', '7138', '0', 1773436001.566]
+    def _parse_data(self, line):
+        """
+        Parse a DATA line into an ArduinoEvent.
+        Format: DATA,trial,peg,color,cue_ms,lift_ms,place_ms
+
+        Returns None if parsing fails.
         """
         try:
-            location_parts = line[0].strip().split(' ')
-            if len(location_parts) != 2:
+            parts = line.split(",")
+            if len(parts) != 7:
                 return None
 
-            location_type = location_parts[0]   # "CENTER" or "PEG"
-            pin_raw       = location_parts[1]    # "51", "52", etc.
-            event         = line[1].strip()      # "LIFTED" or "PLACED"
-            arduino_ms    = line[2].strip()
-            manual        = line[3].strip()
-            timestamp     = line[4]
+            trial      = int(parts[1])
+            target_peg = int(parts[2])
+            color      = parts[3]
+            cue_ms     = int(parts[4])
+            lift_ms    = int(parts[5])
+            place_ms   = int(parts[6])
 
-            if location_type not in ("CENTER", "PEG"):
-                return None
-            if event not in ("LIFTED", "PLACED"):
-                return None
+            # Convert Arduino milliseconds to Unix time using SYNC reference
+            unix_cue   = self._python_sync_time + ((cue_ms   - self._arduino_sync_millis) / 1000.0)
+            unix_lift  = self._python_sync_time + ((lift_ms  - self._arduino_sync_millis) / 1000.0)
+            unix_place = self._python_sync_time + ((place_ms - self._arduino_sync_millis) / 1000.0)
 
-            return ArduinoEvent(location_type, pin_raw, event,
-                                arduino_ms, manual, timestamp)
+            return ArduinoEvent(
+                event_type = "DATA",
+                trial      = trial,
+                target_peg = target_peg,
+                color      = color,
+                unix_cue   = unix_cue,
+                unix_lift  = unix_lift,
+                unix_place = unix_place
+            )
         except Exception as e:
-            print(f"[Arduino] Parse error: {e}")
+            print(f"[Arduino] Parse error on '{line}': {e}")
             return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Standalone mode — original behaviour when run directly
+# Standalone mode
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == '__main__':
-    # This runs the original standalone behaviour:
-    # reads Arduino and lets you type commands, exactly as before.
     reader = ArduinoReader()
     reader.start()
 
-    print("--- Type your command and press Enter to send to Arduino ---")
+    print("\n--- Python Monitor Ready ---")
+    print(f"Data will be saved to: {FILENAME}")
+    print("Type 's' and press Enter to START the experiment.")
+    print("Type 'q' and press Enter to ABORT.")
+    print("----------------------------\n")
+
     try:
         while True:
             cmd = input("> ")
-            reader.send_command(cmd)
+            if cmd.strip():
+                reader.send_command(cmd.strip())
     except KeyboardInterrupt:
-        print("\nClosing connection...")
+        print("\nExiting...")
         reader.stop()
