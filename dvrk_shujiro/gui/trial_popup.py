@@ -117,6 +117,8 @@ class TrialPopup:
         self._win.attributes('-topmost', True)
         self._win.attributes('-alpha', 0.90)
         self._win.overrideredirect(True)    # borderless, no title bar
+        self._win.lift()           # ← add this
+        self._win.focus_force()    # ← add this
 
         # Position: bottom-center of screen
         sw = self._win.winfo_screenwidth()
