@@ -4,6 +4,7 @@ import csv
 import sys
 import threading
 import tkinter as tk
+import signal
 
 # ── Popup import ──────────────────────────────────────────────────────────────
 sys.path.insert(0, '/home/stanford/dvrk_shujiro_ws/src/dvrk_shujiro')
@@ -15,7 +16,7 @@ BAUD_RATE    = 9600
 CSV_FILENAME = 'experiment_data.csv'
 
 
-def main(popup):
+def arduino_loop(popup):
     """
     Runs in a background thread.
     with popup.show_threadsafe() and popup.complete_threadsafe() added.
@@ -103,32 +104,40 @@ def main(popup):
         print(f"[Arduino thread error] {e}")
 
 
-# def main():
-#     # ── Setup tkinter root (hidden) and popup ─────────────────────────────────
-#     root = tk.Tk()
-#     root.withdraw()
-#     popup = TrialPopup(root=root)
+def main():
+    # ── Setup tkinter root (hidden) and popup ─────────────────────────────────
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-alpha', 0.0)     # Make it completely transparent
+    # root.geometry('1x1+0+0')           # Make it tiny (1x1 pixel at 0,0)
+    # root.overrideredirect(True)        # No window decorations
+    popup = TrialPopup(root=root)
 
-#     # ── Start Arduino loop in background thread ───────────────────────────────
-#     thread = threading.Thread(
-#         target=arduino_loop,
-#         args=(popup,),
-#         daemon=True
-#     )
-#     thread.start()
+    # ── Signal handler for Ctrl+C ─────────────────────────────────────────────
+    def signal_handler(sig, frame):
+        print('\n\n[SHUTDOWN] Ctrl+C detected, exiting...')
+        popup.print_final_score()
+        root.quit()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
 
-#     # ── Keep tkinter alive with periodic update ───────────────────────────────
-#     def keep_alive():
-#         root.after(100, keep_alive)
+    # ── Start Arduino loop in background thread ───────────────────────────────
+    thread = threading.Thread(
+        target=arduino_loop,
+        args=(popup,),
+        daemon=True
+    )
+    thread.start()
 
-#     root.after(100, keep_alive)
+    # ── Keep tkinter alive with periodic update ───────────────────────────────
+    def keep_alive():
+        root.after(100, keep_alive)
 
-#     try:
-#         root.mainloop()
-#     except KeyboardInterrupt:
-#         print("\nExiting...")
-#     finally:
-#         popup.print_final_score()
+    root.after(100, keep_alive)
+
+    print("[INFO] Press Ctrl+C to quit")
+    root.mainloop()
 
 
 if __name__ == '__main__':

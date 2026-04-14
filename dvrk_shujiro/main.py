@@ -34,14 +34,14 @@ def main(args=None):
     gui = TimerGUI(max_time=MAX_TIME_SEC)
 
     # ── Trial popup ───────────────────────────────────────────────────────────
-    popup = TrialPopup(root=gui.window_left.root)  # Use left window root for thread-safe popups    
+    # popup = TrialPopup(root=gui.window_left.root)  # Use left window root for thread-safe popups    
     
     # ── ROS node ───────────────────────────────────────────────────
     node = TaskTimerNode(gui)
 
     # ── Arduino reader ────────────────────────────────────────────────────────
-    arduino = ArduinoReader(port=ARDUINO_PORT, callback=popup.on_arduino_event)
-    arduino.start()
+    # arduino = ArduinoReader(port=ARDUINO_PORT, callback=popup.on_arduino_event)
+    # arduino.start()
 
     # ── Start ROS spinning in background thread ─────────────────────────────────────────────
     node.start_spinning()  

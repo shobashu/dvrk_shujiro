@@ -2,7 +2,7 @@
 Trial Popup Window
 ------------------
 A floating window that appears when a cylinder is lifted from a center peg.
-Shows a live progress bar counting up to 2 minutes (MAX_TIME_SEC from config).
+Shows a live progress bar counting up to 1 minutes (MAX_TIME_SEC from config).
 Freezes and disappears when the cylinder is placed on a target peg.
 
 Lifecycle:
@@ -14,17 +14,13 @@ Lifecycle:
 import tkinter as tk
 import time
 
-try:
-    from ..config import MAX_TIME_SEC
-except ImportError:
-    MAX_TIME_SEC = 120
-
+MAX_TIME_SEC = 60 # time limit (seconds)
 
 # ── Popup display settings ────────────────────────────────────────────────────
-POPUP_WIDTH     = 340
-POPUP_HEIGHT    = 130
+POPUP_WIDTH     = 300
+POPUP_HEIGHT    = 100
 POPUP_SHOW_MS   = 2000      # how long result stays visible before hiding (ms)
-UPDATE_MS       = 50        # refresh rate (50ms = 20fps)
+UPDATE_MS       = 33        # refresh rate (30fps = 33ms, 20fps = 50ms)
 
 # Time thresholds for bar color (seconds) — matches your existing timer logic
 THRESHOLD_ORANGE = MAX_TIME_SEC * 0.70   # 70% → orange  (same as PROGRESS_YELLOW_THRESHOLD)
@@ -39,9 +35,11 @@ COLORS = {
     'bar_orange' : '#4a3510',
     'bar_red'    : '#3a0a0a',
     'bar_done'   : '#2a6a10',
+    'bar_failed' : '#5a0a0a',    
     'text_dim'   : '#606060',
     'text_bright': '#909090',
     'text_done'  : '#80c060',
+    'text_failed': '#c06060',    
 }
 
 
@@ -57,17 +55,19 @@ class TrialPopup:
         """
         Args:
             root : the main tkinter root window (from TimerGUI).
-                   Needed to schedule callbacks safely on the main thread.
+                Needed to schedule callbacks safely on the main thread.
         """
         self._root       = root
-        self._win        = None         # the Toplevel popup window
-        self._start_time = None         # time.time() when trial started
-        self._running    = False        # is the timer currently counting?
+        self._win        = None
+        self._start_time = None
+        self._running    = False
 
         # Score tracking
         self.trial_count   = 0
         self.placed_count  = 0
-        self.trial_times   = []         # duration (seconds) of each completed trial
+        self.failed_count  = 0          
+        self.trial_times   = []
+        self.failed_times  = []         
 
     # ── Thread-safe API (call these from the Arduino background thread) ────────
 
@@ -87,66 +87,112 @@ class TrialPopup:
         print("        FINAL SESSION SCORE")
         print("=" * 40)
         print(f"  Trials started   : {self.trial_count}")
-        print(f"  Cylinders placed : {self.placed_count}")
+        print(f"  Placed        : {self.placed_count}")
+        print(f"  Failed        : {self.failed_count}")
+        
         if self.trial_times:
             avg  = sum(self.trial_times) / len(self.trial_times)
             best = min(self.trial_times)
-            print(f"  Average time     : {self._fmt(avg)}")
-            print(f"  Best time        : {self._fmt(best)}")
+            print(f"\n  Successful trials:")
+            print(f"    Average time   : {self._fmt(avg)}")
+            print(f"    Best time      : {self._fmt(best)}")
+        
+        if self.failed_times:
+            avg_fail = sum(self.failed_times) / len(self.failed_times)
+            print(f"\n  Failed trials:")
+            print(f"    Average time   : {self._fmt(avg_fail)}")
+        
+        # Calculate success rate
+        if self.trial_count > 0:
+            success_rate = (self.placed_count / self.trial_count) * 100
+            print(f"\n  Success rate     : {success_rate:.1f}%")
+        
         print("=" * 40 + "\n")
 
     # ── Internal — main thread only ───────────────────────────────────────────
 
     def _show(self):
-        """Create and show the popup. Start counting."""
-        # Destroy any leftover popup from previous trial
-        if self._win is not None:
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
+        """Create and show the popup on ALL THREE MONITORS simultaneously."""
+        # Destroy any leftover popups from previous trial
+        if hasattr(self, '_wins') and self._wins:
+            for win in self._wins:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
 
         self._start_time = time.time()
         self._running    = True
         self.trial_count += 1
 
-        # ── Build the window ──────────────────────────────────────────────────
-        self._win = tk.Toplevel(self._root)
-        self._win.title("")
-        self._win.configure(bg=COLORS['bg'])
-        self._win.attributes('-topmost', True)
-        self._win.attributes('-alpha', 0.90)
-        self._win.overrideredirect(True)    # borderless, no title bar
-        self._win.lift()           # ← add this
-        self._win.focus_force()    # ← add this
+        # ── Monitor positions from xrandr ─────────────────────────────────────────
+        # Monitor 0 (HDMI-1): 3840x2160 at +1280+0
+        # Monitor 1 (DP-0):   640x480   at +640+0
+        # Monitor 2 (DP-2):   640x480   at +0+0
+        
+        monitors = [
+            {'name': 'HDMI-1', 'x': 1280, 'y': 0, 'width': 3840, 'height': 2160},  # Monitor 0
+            {'name': 'DP-0',   'x': 640,  'y': 0, 'width': 640,  'height': 480},   # Monitor 1
+            {'name': 'DP-2',   'x': 0,    'y': 0, 'width': 640,  'height': 480},   # Monitor 2
+        ]
 
-        # Position: bottom-center of screen
-        sw = self._win.winfo_screenwidth()
-        sh = self._win.winfo_screenheight()
-        x  = (sw - POPUP_WIDTH) // 2
-        y  = sh - POPUP_HEIGHT - 60
-        self._win.geometry(f"{POPUP_WIDTH}x{POPUP_HEIGHT}+{x}+{y}")
+        # Top-left offset (margin from edges)
+        MARGIN_X = 20
+        MARGIN_Y = 20
+
+        # Create one popup window per monitor
+        self._wins = []
+        self._canvases = []
+        self._bars = []
+        self._time_labels = []
+        self._titles = []
+        self._statuses = []
+
+        for monitor in monitors:
+            win = self._create_popup_window(
+                x=monitor['x'] + MARGIN_X,
+                y=monitor['y'] + MARGIN_Y
+            )
+            self._wins.append(win)
+
+        # Start the update loop
+        self._update()
+
+
+    def _create_popup_window(self, x, y):
+        """Helper function to create a single popup window at position (x, y)."""
+        win = tk.Toplevel(self._root)
+        win.title("")
+        win.configure(bg=COLORS['bg'])
+        win.attributes('-topmost', True)
+        win.attributes('-alpha', 0.90)
+        win.overrideredirect(True)
+        win.lift()
+        win.focus_force()
+
+        win.geometry(f"{POPUP_WIDTH}x{POPUP_HEIGHT}+{x}+{y}")
 
         # Thin coloured border
-        border = tk.Frame(self._win, bg=COLORS['border'], padx=1, pady=1)
+        border = tk.Frame(win, bg=COLORS['border'], padx=1, pady=1)
         border.pack(fill='both', expand=True)
 
         inner = tk.Frame(border, bg=COLORS['bg'], padx=12, pady=10)
         inner.pack(fill='both', expand=True)
 
         # Title
-        self._title = tk.Label(
+        title = tk.Label(
             inner,
-            text=f"⏱  TRIAL {self.trial_count} IN PROGRESS",
+            text=f"TRIAL {self.trial_count} IN PROGRESS",
             font=("Arial", 9, "bold"),
             fg=COLORS['text_dim'],
             bg=COLORS['bg']
         )
-        self._title.pack(anchor='w')
+        title.pack(anchor='w')
+        self._titles.append(title)
 
         # Progress bar canvas
         bar_width = POPUP_WIDTH - 28
-        self._canvas = tk.Canvas(
+        canvas = tk.Canvas(
             inner,
             width=bar_width,
             height=28,
@@ -154,53 +200,61 @@ class TrialPopup:
             highlightthickness=1,
             highlightbackground=COLORS['border']
         )
-        self._canvas.pack(pady=(6, 4))
+        canvas.pack(pady=(6, 4))
+        self._canvases.append(canvas)
 
         # Bar background
-        self._canvas.create_rectangle(
+        canvas.create_rectangle(
             0, 0, bar_width, 28,
             fill=COLORS['bar_bg'],
             outline=COLORS['border']
         )
 
         # Bar fill (starts empty, grows right)
-        self._bar = self._canvas.create_rectangle(
+        bar = canvas.create_rectangle(
             0, 0, 0, 28,
             fill=COLORS['bar_green'],
             outline=''
         )
+        self._bars.append(bar)
 
         # Time text centered on bar
-        self._time_label = self._canvas.create_text(
+        time_label = canvas.create_text(
             bar_width // 2, 14,
             text="00:00.0",
             font=("Arial", 11, "bold"),
             fill=COLORS['text_bright']
         )
+        self._time_labels.append(time_label)
 
         # Status text below bar
-        self._status = tk.Label(
+        status = tk.Label(
             inner,
-            text="Cylinder lifted — place on target peg",
+            text="Place on target peg & back",
             font=("Arial", 9),
             fg=COLORS['text_dim'],
             bg=COLORS['bg']
         )
-        self._status.pack(anchor='w')
+        status.pack(anchor='w')
+        self._statuses.append(status)
 
-        # Start the update loop
-        self._update()
+        return win
 
     def _update(self):
-        """Refresh bar and time every UPDATE_MS milliseconds."""
-        if not self._running or self._win is None:
+        """Refresh all bars and times every UPDATE_MS milliseconds."""
+        if not self._running or not self._wins:
             return
 
         elapsed  = time.time() - self._start_time
         bar_w    = POPUP_WIDTH - 28
         fill_w   = int(bar_w * min(1.0, elapsed / MAX_TIME_SEC))
 
-        # Bar color changes with time — same thresholds as your main timer
+        # ── Check for timeout (FAILURE) ───────────────────────────────────────
+        if elapsed >= MAX_TIME_SEC:
+            self._fail()  # Trigger failure
+            return
+
+        # Bar color changes with time
         if elapsed < THRESHOLD_ORANGE:
             color = COLORS['bar_green']
         elif elapsed < THRESHOLD_RED:
@@ -208,19 +262,70 @@ class TrialPopup:
         else:
             color = COLORS['bar_red']
 
-        self._canvas.coords(self._bar, 0, 0, fill_w, 28)
-        self._canvas.itemconfig(self._bar, fill=color)
-        self._canvas.itemconfig(self._time_label, text=self._fmt(elapsed))
+        # Update ALL canvases
+        for i, canvas in enumerate(self._canvases):
+            canvas.coords(self._bars[i], 0, 0, fill_w, 28)
+            canvas.itemconfig(self._bars[i], fill=color)
+            canvas.itemconfig(self._time_labels[i], text=self._fmt(elapsed))
 
-        self._win.after(UPDATE_MS, self._update)
+        # Schedule next update
+        self._root.after(UPDATE_MS, self._update)
 
-    def _complete(self):
-        """Freeze the display and show placement confirmation."""
+    def _fail(self):
+        """Called when time limit is exceeded. Show failure message."""
         if not self._running:
             return
 
         self._running = False
         duration      = time.time() - self._start_time
+        self.failed_count += 1
+        self.failed_times.append(duration)
+
+        # Terminal log
+        print(f"\n[Trial {self.trial_count}] FAILED - Time limit exceeded ({self._fmt(duration)})")
+        print(f"[Score] {self.placed_count} placed / {self.failed_count} failed / {self.trial_count} total\n")
+
+        if not self._wins:
+            return
+
+        # Update ALL windows to show failure
+        for i in range(len(self._wins)):
+            self._titles[i].config(text="  TIME LIMIT EXCEEDED!", fg='#8a2a2a')
+            self._statuses[i].config(
+                text=f"Trial {self.trial_count} FAILED — {self._fmt(duration)}",
+                fg=COLORS['text_failed']
+            )
+
+            # Fill bar completely in failure color
+            bar_w = POPUP_WIDTH - 28
+            self._canvases[i].coords(self._bars[i], 0, 0, bar_w, 28)
+            self._canvases[i].itemconfig(self._bars[i], fill=COLORS['bar_failed'])
+            self._canvases[i].itemconfig(
+                self._time_labels[i],
+                text=self._fmt(MAX_TIME_SEC),
+                fill=COLORS['text_failed']
+            )
+
+        # Auto-hide after POPUP_SHOW_MS
+        self._root.after(POPUP_SHOW_MS, self._hide)
+
+    def _complete(self):
+        """Freeze the display and show placement confirmation on ALL monitors."""
+        if not self._running:
+            return  # Already completed or failed
+
+        self._running = False
+        duration      = time.time() - self._start_time
+        
+        # ── Check if placement happened after timeout ────────────────────────
+        if duration >= MAX_TIME_SEC:
+            # Late placement - still counts as failure
+            print(f"\n[Trial {self.trial_count}] Placed after timeout ({self._fmt(duration)}) - counted as FAILURE")
+            self.failed_count += 1
+            self.failed_times.append(duration)
+            self._fail()  # Show failure UI
+            return
+
         self.placed_count += 1
         self.trial_times.append(duration)
 
@@ -228,41 +333,47 @@ class TrialPopup:
         print(f"\n[Trial {self.trial_count}] Placed in {self._fmt(duration)}")
         print(f"[Score] {self.placed_count}/{self.trial_count} placements\n")
 
-        if self._win is None:
+        if not self._wins:
             return
 
-        # Update title and status
-        self._title.config(text="✅  PLACED!", fg='#4a8a2a')
-        self._status.config(
-            text=f"Trial {self.trial_count}  —  {self._fmt(duration)}",
-            fg=COLORS['text_bright']
-        )
+        # Update ALL windows
+        for i in range(len(self._wins)):
+            self._titles[i].config(text="PLACED !", fg='#4a8a2a')
+            self._statuses[i].config(
+                text=f"Trial {self.trial_count}  —  {self._fmt(duration)}",
+                fg=COLORS['text_bright']
+            )
 
-        # Freeze bar at current fill, switch to done color
-        bar_w  = POPUP_WIDTH - 28
-        fill_w = int(bar_w * min(1.0, duration / MAX_TIME_SEC))
-        self._canvas.coords(self._bar, 0, 0, fill_w, 28)
-        self._canvas.itemconfig(self._bar, fill=COLORS['bar_done'])
-        self._canvas.itemconfig(
-            self._time_label,
-            text=self._fmt(duration),
-            fill=COLORS['text_done']
-        )
+            # Freeze bar at current fill, switch to done color
+            bar_w  = POPUP_WIDTH - 28
+            fill_w = int(bar_w * min(1.0, duration / MAX_TIME_SEC))
+            self._canvases[i].coords(self._bars[i], 0, 0, fill_w, 28)
+            self._canvases[i].itemconfig(self._bars[i], fill=COLORS['bar_done'])
+            self._canvases[i].itemconfig(
+                self._time_labels[i],
+                text=self._fmt(duration),
+                fill=COLORS['text_done']
+            )
 
         # Auto-hide after POPUP_SHOW_MS
-        self._win.after(POPUP_SHOW_MS, self._hide)
+        self._root.after(POPUP_SHOW_MS, self._hide)
 
     def _hide(self):
-        """Destroy the popup window."""
-        if self._win is not None:
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
-            self._win = None
+        """Destroy all popup windows."""
+        if hasattr(self, '_wins') and self._wins:
+            for win in self._wins:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+            self._wins = []
+            self._canvases = []
+            self._bars = []
+            self._time_labels = []
+            self._titles = []
+            self._statuses = []
 
-    @staticmethod
-    def _fmt(seconds):
+    def _fmt(self, seconds):
         """Format seconds as MM:SS.T  e.g. 75.3 → '01:15.3'"""
         m = int(seconds // 60)
         s = int(seconds % 60)
