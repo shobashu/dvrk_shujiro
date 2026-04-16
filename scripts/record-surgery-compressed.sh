@@ -4,6 +4,15 @@
 
 #!/usr/bin/env bash
 
+# # Data:
+# /camera_left/compressed \
+# /camera_right/compressed \
+# /PSM1/measured_cp \
+# /PSM1/jaw/measured_js \
+# /PSM2/measured_cp \ # robot kinematics
+# /PSM2/jaw/measured_js \ # jaw joint states (open/close) for each arm
+# /ECM/measured_cp # camera arm position
+
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
 
@@ -13,7 +22,7 @@ echo "════════════════════════�
 echo ""
 read -p "Enter recording name: " NAME
 
-RECORDINGS_DIR=~/dvrk_recordings/compressed
+RECORDINGS_DIR=~/dvrk_recordings/training
 mkdir -p $RECORDINGS_DIR
 cd $RECORDINGS_DIR
 
@@ -26,7 +35,6 @@ echo "  /camera_left/compressed (~30 fps, JPEG)"
 echo "  /camera_right/compressed (~30 fps, JPEG)"
 echo "  /PSM1/measured_cp (robot kinematics)"
 echo "  /PSM2/measured_cp (robot kinematics)"
-echo "  /ECM/measured_cp (camera arm position)"
 echo ""
 echo " File size: ~50-100 MB/min (vs 1.8 GB/min raw)"
 echo ""
@@ -36,10 +44,8 @@ echo ""
 ros2 bag record \
   -o $NAME \
   /camera_left/compressed \
-  /camera_right/compressed \
   /PSM1/measured_cp \
-  /PSM2/measured_cp \
-  /ECM/measured_cp
+  /PSM2/measured_cp 
 
 echo ""
 echo "✓ Recording saved to: $RECORDINGS_DIR/$NAME"
