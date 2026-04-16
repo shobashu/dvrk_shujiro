@@ -1,0 +1,25 @@
+# dVRK cylinder & peg detection dataset
+# YOLO format — all paths relative to this file's location
+
+path: ../data/dataset
+
+train: images/train
+val:   images/val
+test:  images/test
+
+# Number of classes
+nc: 4
+
+# Class definitions
+# Keep peg states as separate classes so YOLO learns color-specific features
+names:
+  0: cylinder          # two-colored cylinder (white top, blue bottom)
+  1: peg_inactive      # unlit peg (target not selected)
+  2: peg_lit_blue      # peg lit blue  (place blue-side down)
+  3: peg_lit_white     # peg lit white (place white-side up)
+
+# Notes:
+# - Annotate the FULL cylinder, not just top or bottom half
+# - Annotate ALL pegs in frame, lit or not — do not skip inactive ones
+# - Tight bbox: exclude gripper shadow where possible
+# - When cylinder is gripped, still annotate the visible portion

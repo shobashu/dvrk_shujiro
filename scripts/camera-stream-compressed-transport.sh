@@ -42,7 +42,7 @@ ros2 run gscam gscam_node --ros-args \
   -r __node:=gscam_left \
   -r camera/image_raw:=camera_left/image_raw \
   -r camera/camera_info:=camera_left/camera_info \
-  -p gscam_config:="decklinkvideosrc device-number=1 ! videoconvert" \
+  -p gscam_config:="decklinkvideosrc device-number=0 ! videoconvert ! videobalance brightness=0.1 contrast=1.2 saturation=1.5 hue=0.0" \
   -p camera_name:=camera_left \
   -p frame_id:=camera &
 LEFT_CAM_PID=$!
