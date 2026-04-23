@@ -41,11 +41,14 @@ echo ""
 echo "Press Ctrl+C to stop recording"
 echo ""
 
-ros2 bag record \
-  -o $NAME \
-  /camera_left/compressed \
+ros2 bag record -o "$NAME" --topics \
+  /camera_left/image_raw \
+  /camera_right/image_raw \
+  /camera_left/camera_info \
+  /camera_right/camera_info \
   /PSM1/measured_cp \
-  /PSM2/measured_cp 
+  /PSM2/measured_cp \
+  /ECM/measured_cp
 
 echo ""
 echo "✓ Recording saved to: $RECORDINGS_DIR/$NAME"

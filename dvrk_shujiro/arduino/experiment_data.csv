@@ -69,3 +69,7 @@ Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
 Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
 1,6,White,1776193695.161,1776193697.991,1776193700.021
 2,5,Blue,1776193703.751,1776193706.021,1776193707.181
+Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
+1,6,White,1776819703.605,1776820145.115,1776820155.255
+2,5,Blue,1776820162.685,1776820173.985,1776820175.275
+3,3,White,1776820179.805,1776820184.995,1776820186.705

@@ -55,9 +55,8 @@ def extract_frames(bag_path, output_dir, target_fps=5, camera_topic=None):
     default_camera_topics = [
         # '/camera/left/compressed',
         # '/camera_left/compressed',
-        # '/camera/left/image_raw',
-        '/camera_right/compressed',
-        '/camera_right/image_raw'
+        '/camera_left/image_raw',
+        '/camera_right/image_raw',
         # '/endoscope/left/compressed',
         # '/stereo/left/compressed',
         # '/jhu_crsus/left/image_raw',
