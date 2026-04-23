@@ -1,6 +1,7 @@
 # Run with this command:
 # cd ~/dvrk_shujiro_ws/src/dvrk_shujiro
 # python3 -m dvrk_shujiro.main
+# U need to deactiate conda
 
 #!/usr/bin/env python3
 """
@@ -12,9 +13,9 @@ import threading
 
 from .config import ARDUINO_PORT, MAX_TIME_SEC
 from .gui.timer_window import TimerGUI
-from .gui.trial_popup import TrialPopup
 from .nodes.task_timer_node import TaskTimerNode
-from .arduino.read_arduino import ArduinoReader
+# from .gui.trial_popup import TrialPopup
+# from .arduino.read_arduino import ArduinoReader
 
 
 
