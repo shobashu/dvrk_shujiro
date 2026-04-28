@@ -1,0 +1,5 @@
+train: /home/cfxuser/data_shujiro/Task_Pad_Cylinder_Pegs_yolov8/prepared_train/images/train                                                                                             
+val:   /home/cfxuser/data_shujiro/Task_Pad_Cylinder_Pegs_yolov8/prepared_train/images/val                                                                                             
+test:  /home/cfxuser/data_shujiro/Task_Pad_Cylinder_Pegs_yolov8/prepared_train/images/test                                                                                                                                                                                                                                                                         
+nc: 4                                                                                                                                                                    
+names: ['cylinder', 'peg_inactive', 'peg_lit_blue', 'peg_lit_white'] 

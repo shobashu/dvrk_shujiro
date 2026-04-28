@@ -114,7 +114,7 @@ def validate(weights_path: str, data_yaml: str = "config/dataset.yaml"):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model",   default="yolov8n.pt")
-    p.add_argument("--data",    default="config/dataset.yaml")
+    p.add_argument("--data",    default="data.yaml")
     p.add_argument("--epochs",  type=int,   default=80)
     p.add_argument("--imgsz",   type=int,   default=640)
     p.add_argument("--batch",   type=int,   default=16)
