@@ -17,118 +17,122 @@ def resolve_bag_path(bag_input: str) -> str:
     """Convert relative bag name to absolute path."""
     bag_base = Path.home() / "dvrk_recordings"
     bag_path = Path(bag_input)
-    
+
     if bag_path.is_absolute():
         return str(bag_path)
-    
+
     resolved = bag_base / bag_path
     return str(resolved)
 
 
-def extract_frames(bag_path, output_dir, target_fps=5, camera_topic=None):
+def decode_image(msg, is_compressed):
+    if is_compressed:
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        return cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    else:
+        height, width = msg.height, msg.width
+        cv_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, width, -1)
+        if msg.encoding == 'rgb8':
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
+        return cv_image
+
+
+def extract_frames(bag_path, output_dir, target_fps=5, left_topic=None, right_topic=None):
     """Extract frames and kinematics from ROS 2 bag"""
-    
+
     bag_path = Path(bag_path)
     output_dir = Path(output_dir)
-    
-    images_dir = output_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
-    
-    print(f"📂 Reading bag: {bag_path}")
-    print(f"💾 Output directory: {output_dir}")
-    print(f"🎞️  Target FPS: {target_fps}")
-    if camera_topic:
-        print(f"📹 Specified camera topic: {camera_topic}")
+
+    print(f"Reading bag: {bag_path}")
+    print(f"Output directory: {output_dir}")
+    print(f"Target FPS: {target_fps}")
     print()
-    
-    # Get typestore for deserialization
+
     typestore = get_typestore(Stores.ROS2_HUMBLE)
-    
+
     kinematics_data = []
-    kinematics_matched = []  # kinematic data with matching pictures
-    frame_count = 0
-    last_frame_time = None
+    kinematics_matched = []
     last_frame_time_kinematic1 = None
     last_frame_time_kinematic2 = None
     frame_interval = 1.0 / target_fps
-    
-    default_camera_topics = [
-        # '/camera/left/compressed',
-        # '/camera_left/compressed',
-        '/camera_left/image_raw',
-        '/camera_right/image_raw',
-        # '/endoscope/left/compressed',
-        # '/stereo/left/compressed',
-        # '/jhu_crsus/left/image_raw',
-    ]
-    
+
+    default_left_topics = ['/camera_left/image_raw', '/camera/left/image_raw', '/camera/left/compressed']
+    default_right_topics = ['/camera_right/image_raw', '/camera/right/image_raw', '/camera/right/compressed']
+
     with Reader(bag_path) as reader:
         available_topics = {conn.topic for conn in reader.connections}
-        print("📋 Available topics in bag:")
+        print("Available topics in bag:")
         for topic in sorted(available_topics):
             print(f"   {topic}")
         print()
-        
-        if camera_topic:
-            if camera_topic not in available_topics:
-                print(f"❌ ERROR: Specified topic '{camera_topic}' not found!")
+
+        # Resolve left topic
+        if left_topic:
+            if left_topic not in available_topics:
+                print(f"ERROR: Left topic '{left_topic}' not found!")
                 return
-            final_camera_topic = camera_topic
+            final_left = left_topic
         else:
-            final_camera_topic = None
-            for topic in default_camera_topics:
-                if topic in available_topics:
-                    final_camera_topic = topic
-                    break
-            
-            if not final_camera_topic:
-                print("❌ ERROR: No camera topic found!")
-                print(f"   Use --topic to specify manually")
+            final_left = next((t for t in default_left_topics if t in available_topics), None)
+
+        # Resolve right topic
+        if right_topic:
+            if right_topic not in available_topics:
+                print(f"ERROR: Right topic '{right_topic}' not found!")
                 return
-        
-        print(f"✅ Using camera topic: {final_camera_topic}")
-        
-        is_compressed = False
-        for conn in reader.connections:
-            if conn.topic == final_camera_topic:
-                print(f"   Message type: {conn.msgtype}")
-                is_compressed = 'CompressedImage' in conn.msgtype
-                break
+            final_right = right_topic
+        else:
+            final_right = next((t for t in default_right_topics if t in available_topics), None)
+
+        if not final_left and not final_right:
+            print("ERROR: No camera topics found! Use --left-topic / --right-topic to specify manually.")
+            return
+
+        # Build per-topic state
+        camera_topics = {}
+        for side, topic in [('left', final_left), ('right', final_right)]:
+            if topic is None:
+                continue
+            images_dir = output_dir / "images" / side
+            images_dir.mkdir(parents=True, exist_ok=True)
+            is_compressed = any('CompressedImage' in conn.msgtype for conn in reader.connections if conn.topic == topic)
+            msgtype = next(conn.msgtype for conn in reader.connections if conn.topic == topic)
+            camera_topics[topic] = {
+                'side': side,
+                'images_dir': images_dir,
+                'is_compressed': is_compressed,
+                'frame_count': 0,
+                'last_frame_time': None,
+            }
+            print(f"Using {side} camera topic: {topic}  ({msgtype})")
         print()
-        
-        print("🔄 Processing messages...")
+
+        print("Processing messages...")
         print()
-        
+
         for connection, timestamp, rawdata in reader.messages():
-            # Deserialize using typestore
             msg = typestore.deserialize_cdr(rawdata, connection.msgtype)
-            
-            if connection.topic == final_camera_topic:
+
+            if connection.topic in camera_topics:
+                state = camera_topics[connection.topic]
                 msg_time = timestamp / 1e9
-                
-                if last_frame_time is None or (msg_time - last_frame_time) >= frame_interval:
+
+                if state['last_frame_time'] is None or (msg_time - state['last_frame_time']) >= frame_interval:
                     try:
-                        if is_compressed:
-                            np_arr = np.frombuffer(msg.data, np.uint8)
-                            cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                        else:
-                            height, width = msg.height, msg.width
-                            cv_image = np.frombuffer(msg.data, dtype=np.uint8).reshape(height, width, -1)
-                            if msg.encoding == 'rgb8':
-                                cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
-                        
+                        cv_image = decode_image(msg, state['is_compressed'])
+                        frame_count = state['frame_count']
                         frame_filename = f"frame_{frame_count:04d}.jpg"
-                        frame_path = images_dir / frame_filename
+                        frame_path = state['images_dir'] / frame_filename
                         cv2.imwrite(str(frame_path), cv_image)
-                        
+
                         if frame_count % 10 == 0:
-                            print(f"   Extracted frame {frame_count}: {frame_filename}")
-                        
-                        frame_count += 1
-                        last_frame_time = msg_time
-                        
+                            print(f"   [{state['side']}] frame {frame_count}: {frame_filename}")
+
+                        state['frame_count'] += 1
+                        state['last_frame_time'] = msg_time
+
                     except Exception as e:
-                        print(f"⚠️  Warning: Failed to decode frame at {msg_time:.2f}s: {e}")
+                        print(f"Warning: Failed to decode [{state['side']}] frame at {msg_time:.2f}s: {e}")
             
             elif connection.topic == '/PSM1/measured_cp':
                 if last_frame_time_kinematic1 is None or ((timestamp / 1e9) - last_frame_time_kinematic1) >= frame_interval:
@@ -200,45 +204,45 @@ def extract_frames(bag_path, output_dir, target_fps=5, camera_topic=None):
                 })
     
     print()
-    print(f"✅ Extracted {frame_count} frames")
-    
+    for state in camera_topics.values():
+        print(f"Extracted {state['frame_count']} frames [{state['side']}]  -> {state['images_dir']}")
+
     if kinematics_data:
         df = pd.DataFrame(kinematics_data)
         csv_path = output_dir / "kinematics.csv"
         df.to_csv(csv_path, index=False)
-        print(f"✅ Saved kinematics data: {csv_path}")
-        print(f"   Total kinematics samples: {len(df)}")
-    
+        print(f"Saved kinematics data: {csv_path}  ({len(df)} samples)")
+
     if kinematics_matched:
         df = pd.DataFrame(kinematics_matched)
         csv_path = output_dir / "kinematics_matched.csv"
         df.to_csv(csv_path, index=False)
-        print(f"✅ Saved matched kinematics data: {csv_path}")
-        print(f"   Total matched kinematics samples: {len(df)}")
-    
+        print(f"Saved matched kinematics data: {csv_path}  ({len(df)} samples)")
+
     metadata = {
         'bag_file': str(bag_path),
         'extraction_date': pd.Timestamp.now().isoformat(),
         'target_fps': target_fps,
-        'camera_topic': final_camera_topic,
-        'frames_extracted': frame_count,
+        'camera_topics': {state['side']: topic for topic, state in camera_topics.items()},
+        'frames_extracted': {state['side']: state['frame_count'] for state in camera_topics.values()},
     }
-    
+
     metadata_path = output_dir / "metadata.yaml"
     with open(metadata_path, 'w') as f:
         yaml.dump(metadata, f)
-    print(f"✅ Saved metadata: {metadata_path}")
-    
+    print(f"Saved metadata: {metadata_path}")
+
     print()
-    print("🎉 Extraction complete!")
+    print("Extraction complete!")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Extract frames from ROS 2 bag')
     parser.add_argument('--bag', required=True, help='Bag name or path relative to ~/dvrk_recordings')
     parser.add_argument('--out', required=True, help='Output directory')
     parser.add_argument('--fps', type=float, default=2.0, help='Target frames per second (default: 2)')
-    parser.add_argument('--topic', type=str, default=None, help='Camera topic name (auto-detect if not specified)')
-    
+    parser.add_argument('--left-topic', type=str, default=None, help='Left camera topic (auto-detect if not specified)')
+    parser.add_argument('--right-topic', type=str, default=None, help='Right camera topic (auto-detect if not specified)')
+
     args = parser.parse_args()
     bag_path = resolve_bag_path(args.bag)
-    extract_frames(bag_path, args.out, args.fps, args.topic)
+    extract_frames(bag_path, args.out, args.fps, args.left_topic, args.right_topic)

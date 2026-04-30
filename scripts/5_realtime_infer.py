@@ -5,36 +5,36 @@ Step 5 — Real-time YOLOv8 inference on dVRK camera streams.
 Subscribes to ROS2 camera topics, runs YOLO on each frame, and displays
 annotated results in OpenCV windows.
 
-Terminal 1 — start the dVRK + cameras:                                                                                                                                   
-# however you normally start the dVRK console                                                                                                                            
-                                                                            
-Terminal 2 — start the cameras (if not already started by dVRK launch):      
-source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash                                                                                                  
-./camera-stream-raw.sh                                                                                                                                                   
-                                                                                                                                                                        
-Terminal 3 — run the inference:                                                                                                                                          
-source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash                                                                                                  
-cd /home/cfxuser/dvrk_shujiro/scripts                                                                                                                                    
-python 5_realtime_infer.py                                                                                                                                               
-                                                                                                                                                                        
-Two OpenCV windows will pop up (left and right camera) showing the live feed with bounding boxes drawn over the detected objects in real time. You control the arms as
-normal — the inference runs independently in the background.                                                                                                             
-                                                                            
-One thing to note: the script runs on CPU right now (same as training, since the CUDA driver is outdated). Inference on CPU should still be fast enough for a live view, 
-but if it feels laggy let me know and I can add a frame-skip option to reduce load.
+Terminal 1 — start the dVRK + cameras:
+# however you normally start the dVRK console
+
+Terminal 2 — start the cameras (if not already started by dVRK launch):
+source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
+./camera-stream-raw.sh
+
+Terminal 3 — run the inference:
+source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
+cd /home/stanford/dvrk_shujiro_ws/src/dvrk_shujiro/scripts
+python3 5_realtime_infer.py
 
 Usage:
-    # Both cameras (default)
-    python 5_realtime_infer.py
+    # Both cameras, all classes (default)
+    python3 5_realtime_infer.py
+
+    # Cylinder only (faster, less noise)
+    python3 5_realtime_infer.py --classes 0
 
     # Right camera only
-    python 5_realtime_infer.py --camera right
+    python3 5_realtime_infer.py --camera right
+
+    # Smaller inference resolution for less lag
+    python3 5_realtime_infer.py --imgsz 320
 
     # Custom weights / confidence
-    python 5_realtime_infer.py --weights models/best.pt --conf 0.4
+    python3 5_realtime_infer.py --weights models/best.pt --conf 0.4
 
     # Also publish annotated images back to ROS2 topics
-    python 5_realtime_infer.py --publish
+    python3 5_realtime_infer.py --publish
 
 Prerequisites:
     source /opt/ros/jazzy/setup.bash
@@ -43,6 +43,7 @@ Prerequisites:
 """
 
 import argparse
+import re
 import threading
 
 import cv2
@@ -50,10 +51,11 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSPresetProfiles
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 
 from ultralytics import YOLO
 
+# 4 objects classes
 CLASS_NAMES = {
     0: "cylinder",
     1: "peg_inactive",
@@ -61,83 +63,131 @@ CLASS_NAMES = {
     3: "peg_lit_white",
 }
 
-# Colours per class (BGR)
 CLASS_COLORS = {
-    0: (0,   200, 255),   # cylinder     — orange
-    1: (180, 180, 180),   # peg_inactive — grey
-    2: (255, 100,   0),   # peg_lit_blue — blue
-    3: (255, 255, 255),   # peg_lit_white — white
+    0: (0,   200, 255), # orange
+    1: (180, 180, 180), # gray
+    2: (255, 100,   0), # blue
+    3: (255, 255,   0), # yellow
 }
 
 DEFAULT_WEIGHTS = "models/best.pt"
 
 
 # ---------------------------------------------------------------------------
-
+# Node that subscribes to a camera topic, runs YOLO inference in a separate thread,
 class YOLOCameraNode(Node):
     def __init__(self, topic: str, window_name: str, model: YOLO,
-                 conf: float, publish: bool):
-        super().__init__(f"yolo_{window_name.replace(' ', '_')}")
+                 conf: float, imgsz: int, classes: list, publish: bool,
+                 compressed: bool = False):
+        safe = re.sub(r'[^a-zA-Z0-9_]', '_', window_name)
+        safe = re.sub(r'_+', '_', safe).strip('_')
+        super().__init__(f"yolo_{safe}")
+
         self.model = model
         self.conf = conf
+        self.imgsz = imgsz
+        self.classes = classes or None
         self.window_name = window_name
-        self.latest_frame = None
-        self.lock = threading.Lock()
+
+        self._raw_frame = None
+        self._raw_frame_id = 0        # incremented on every new frame
+        self._last_infer_id = -1      # last frame id the inference thread processed
+        self._annotated_frame = None
+        self._raw_lock = threading.Lock()
+        self._ann_lock = threading.Lock()
 
         qos = QoSPresetProfiles.SENSOR_DATA.value
-        self.sub = self.create_subscription(Image, topic, self._image_cb, qos)
+        if compressed:
+            self.sub = self.create_subscription(
+                CompressedImage, topic, self._compressed_image_cb, qos)
+        else:
+            self.sub = self.create_subscription(
+                Image, topic, self._image_cb, qos)
 
         self.pub = None
         if publish:
-            out_topic = topic.replace("/image_raw", "/image_yolo")
-            from sensor_msgs.msg import Image as Img
-            self.pub = self.create_publisher(Img, out_topic, 10)
+            out_topic = topic.replace("/compressed", "/image_yolo").replace("/image_raw", "/image_yolo")
+            self.pub = self.create_publisher(Image, out_topic, 10)
             self.get_logger().info(f"Publishing annotated frames to {out_topic}")
 
         self.get_logger().info(f"Subscribed to {topic}")
 
+
+        # Inference runs in its own thread so the display loop never blocks on YOLO
+        self._stop = threading.Event()
+        self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
+        self._infer_thread.start()
+
+    # ------------------------------------------------------------------
     def _image_cb(self, msg: Image):
-        # Convert ROS Image to numpy BGR
-        dtype = np.uint8
-        frame = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.width, -1)
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         if msg.encoding == "rgb8":
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        elif msg.encoding in ("mono8",):
+        elif msg.encoding == "mono8":
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        with self._raw_lock:
+            self._raw_frame = frame.copy()
+            self._raw_frame_id += 1
 
-        with self.lock:
-            self.latest_frame = frame.copy()
-
-    def process_and_show(self) -> bool:
-        """Run YOLO on latest frame and show it. Returns False if window closed."""
-        with self.lock:
-            frame = self.latest_frame
-
+    def _compressed_image_cb(self, msg: CompressedImage):
+        # msg.data is raw JPEG/PNG bytes — cv2.imdecode handles any format
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
-            return True
+            return
+        with self._raw_lock:
+            self._raw_frame = frame
+            self._raw_frame_id += 1
 
-        results = self.model.predict(frame, conf=self.conf, verbose=False)[0]
-        annotated = self._draw(frame, results)
+    def _infer_loop(self):
+        # This runs in a separate thread and continuously processes the latest frame.
+        while not self._stop.is_set():
+            with self._raw_lock:
+                frame_id = self._raw_frame_id
+                frame = self._raw_frame
 
-        cv2.imshow(self.window_name, annotated)
+            if frame is None or frame_id == self._last_infer_id:
+                self._stop.wait(0.005)
+                continue
+            self._last_infer_id = frame_id
 
-        if self.pub is not None:
-            self._publish(annotated)
+            results = self.model.predict(
+                frame,
+                conf=self.conf,
+                imgsz=self.imgsz,
+                classes=self.classes,
+                verbose=False,
+            )[0]
+            annotated = self._draw(frame, results)
 
-        return True
+            with self._ann_lock:
+                self._annotated_frame = annotated
+
+            if self.pub is not None:
+                self._publish(annotated)
+
+    def show(self):
+        with self._ann_lock:
+            frame = self._annotated_frame
+        if frame is not None:
+            # Display the annotated frame in the OpenCV window
+            cv2.imshow(self.window_name, frame)
+
+    def stop(self):
+        self._stop.set()
+
+    # ------------------------------------------------------------------
 
     def _draw(self, frame: np.ndarray, results) -> np.ndarray:
         out = frame.copy()
         if results.boxes is None:
             return out
-
         for box in results.boxes:
             cls_id = int(box.cls[0])
             conf   = float(box.conf[0])
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             color  = CLASS_COLORS.get(cls_id, (0, 255, 0))
             label  = f"{CLASS_NAMES.get(cls_id, cls_id)} {conf:.2f}"
-
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
             cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
@@ -162,20 +212,30 @@ def main():
 
     rclpy.init()
     model = YOLO(args.weights)
-    print(f"[INFO] Loaded weights: {args.weights}")
-    print(f"[INFO] Confidence threshold: {args.conf}")
+    print(f"[INFO] Loaded weights:   {args.weights}")
+    print(f"[INFO] Confidence:       {args.conf}")
+    print(f"[INFO] Inference size:   {args.imgsz}")
+    print(f"[INFO] Classes filter:   {args.classes if args.classes else 'all'}")
     print("[INFO] Press 'q' in any window to quit.\n")
 
-    nodes = []
-    camera_map = {
-        "left":  ("/camera_left/image_raw",  "Left Camera  — YOLO"),
-        "right": ("/camera_right/image_raw", "Right Camera — YOLO"),
-    }
+    if args.compressed:
+        camera_map = {
+            "left":  ("/camera_left/compressed",  "Left Camera  — YOLO"),
+            "right": ("/camera_right/compressed", "Right Camera — YOLO"),
+        }
+    else:
+        camera_map = {
+            "left":  ("/camera_left/image_raw",  "Left Camera  — YOLO"),
+            "right": ("/camera_right/image_raw", "Right Camera — YOLO"),
+        }
 
     cameras = ["left", "right"] if args.camera == "both" else [args.camera]
+    nodes = []
     for cam in cameras:
         topic, window = camera_map[cam]
-        node = YOLOCameraNode(topic, window, model, args.conf, args.publish)
+        node = YOLOCameraNode(topic, window, model,
+                              args.conf, args.imgsz, args.classes, args.publish,
+                              compressed=args.compressed)
         nodes.append(node)
         cv2.namedWindow(window, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window, 640, 480)
@@ -190,20 +250,33 @@ def main():
     try:
         while rclpy.ok():
             for node in nodes:
-                node.process_and_show()
+                node.show()
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    except KeyboardInterrupt:
+        pass
     finally:
+        for node in nodes:
+            node.stop()
         cv2.destroyAllWindows()
         executor.shutdown()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default=DEFAULT_WEIGHTS)
-    p.add_argument("--conf",    type=float, default=0.25)
-    p.add_argument("--camera",  choices=["left", "right", "both"], default="both")
+    p.add_argument("--conf",    type=float, default=0.5)
+    p.add_argument("--imgsz",   type=int,   default=320,
+                   help="YOLO inference resolution (smaller = faster, default 320)")
+    p.add_argument("--classes", type=int,   nargs="+", default=None,
+                   help="Class IDs to detect: 0=cylinder 1=peg_inactive 2=peg_lit_blue 3=peg_lit_white")
+    p.add_argument("--camera",     choices=["left", "right", "both"], default="both")
+    p.add_argument("--compressed", action="store_true",
+                   help="Subscribe to /compressed topics (CompressedImage) instead of /image_raw")
     p.add_argument("--publish", action="store_true",
                    help="Publish annotated frames to /camera_*/image_yolo")
     return p.parse_args()
