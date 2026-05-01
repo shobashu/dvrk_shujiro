@@ -1,0 +1,18 @@
+# Training runs and checkpoints
+runs/
+
+# Model weights (store externally or in models/ which is also ignored)
+*.pt
+*.pth
+
+# Dataset (stored externally)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
