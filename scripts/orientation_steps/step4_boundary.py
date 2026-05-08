@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+
+To run with THE MOST RELEVANT IMAGES:
+python3 step4_boundary.py --frames 0347 0353 0638 0942 1320 1717 2167 2>&1
+
+
 Step 4 — Orientation angle + visual separation line.
 
 For each crop:
@@ -52,11 +57,25 @@ MIN_PIXELS = 50   # minimum mask pixels to trust a centroid
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _centroid(mask: np.ndarray):
-    """(x, y) centroid of a binary mask, or None if too few pixels."""
-    ys, xs = np.where(mask)
-    if len(xs) < MIN_PIXELS:
+    """(x, y) median centre of the largest connected component, or None if too few pixels.
+
+    Using the largest component so that a second smaller blob (e.g. peg-board
+    background bleed) does not pull the result away from the main region.
+    Median within that component avoids sub-blob outliers shifting the result.
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels < 2:  # label 0 is background
         return None
-    return float(xs.mean()), float(ys.mean())
+
+    # Pick the largest component (skip label 0 = background)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(np.argmax(areas)) + 1  # +1 to re-align with full stats array
+
+    if stats[largest, cv2.CC_STAT_AREA] < MIN_PIXELS:
+        return None
+
+    ys, xs = np.where(labels == largest)
+    return float(np.median(xs)), float(np.median(ys))
 
 
 # ── Orientation ───────────────────────────────────────────────────────────────
@@ -163,13 +182,13 @@ def save_density_chart(blue_row, white_row, blue_c, white_c,
     fig, ax = plt.subplots(figsize=(4.5, max(3.0, crop_h / 55)))
     rows = np.arange(crop_h)
 
-    ax.barh(rows, white_row, color="lightgrey", label="white", height=1.0, align="edge")
+    ax.barh(rows, white_row, color="orange", label="white", height=1.0, align="edge")
     ax.barh(rows, blue_row,  color="steelblue", label="blue",  height=1.0, align="edge", alpha=0.8)
 
     if blue_c is not None:
-        ax.axhline(blue_c[1],   color="blue",  lw=1.2, ls="--", label=f"blue  centroid y={blue_c[1]:.0f}")
+        ax.axhline(blue_c[1],   color="blue",  lw=1.2, ls="--", label=f"blue  median y={blue_c[1]:.0f}")
     if white_c is not None:
-        ax.axhline(white_c[1],  color="grey",  lw=1.2, ls="--", label=f"white centroid y={white_c[1]:.0f}")
+        ax.axhline(white_c[1],  color="yellow", lw=1.2, ls="--", label=f"white median y={white_c[1]:.0f}")
 
     ax.set_xlabel("pixel fraction per row")
     ax.set_ylabel("row  (0 = top of crop)")

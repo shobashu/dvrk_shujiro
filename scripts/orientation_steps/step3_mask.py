@@ -18,7 +18,8 @@ Output:
     runs/orientation_steps/03_masks/<crop_name>.jpg
 
 Run:
-    python3 step3_mask.py
+    python3 step3_mask.py                          # all crops (respects SAMPLE)
+    python3 step3_mask.py 0205 0219 0368           # only those frame numbers
 """
 
 import sys
@@ -67,12 +68,16 @@ def mask_panel(crop: np.ndarray) -> np.ndarray:
 
 
 def main():
+    frame_filter = sys.argv[1:]  # e.g. ["0205", "0219", "0368"]
+
     crops_dir = Path(params.OUT_ROOT) / "01_crops"
     out_dir   = Path(params.OUT_ROOT) / "03_masks"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     crops = sorted(crops_dir.glob("*_cyl*.jpg"))
-    if params.SAMPLE:
+    if frame_filter:
+        crops = [c for c in crops if any(f"frame_{n}_" in c.name for n in frame_filter)]
+    elif params.SAMPLE:
         crops = crops[: params.SAMPLE]
     print(f"[INFO] {len(crops)} crops  →  {out_dir}")
     print(f"  white  H=[{params.WHITE_H_MIN},{params.WHITE_H_MAX}]"
