@@ -1,263 +1,278 @@
 #!/usr/bin/env python3
 """
-Step 6 — Cylinder orientation analysis via HSV color segmentation.
+Step 6 — Real-time cylinder orientation on dVRK camera stream.
 
-For each detected cylinder bbox crop, segments white (top) and blue (bottom)
-regions in HSV, computes the axis angle relative to vertical, and labels each
-detection as upright / tilted / inverted.
+Subscribes to /camera_left/compressed, runs YOLO detection, and for each
+detected cylinder draws the orientation axis on the live feed.
 
-Bbox colors: green = upright, orange = tilted, red = inverted.
+Axis drawing (per crop):
+    green line   — orientation axis (white centroid → blue centroid, extended)
+    orange line  — separation line  (perpendicular at midpoint)
+    red dot      — blue-body centroid
+    blue dot     — white-cap centroid
+    cyan text    — angle in degrees  (0° = upright, ±180° = inverted)
 
 Usage:
-    # Folder of images
-    python3 6_cylinder_orientation.py \
-        --src ~/data_shujiro/Task_Pad_Cylinder_Pegs_yolov8/train/images
-
-    # Custom weights / output
-    python3 6_cylinder_orientation.py \
-        --src ~/data_shujiro/.../train/images \
-        --weights models/best.pt \
-        --output runs/orientation
+    python3 6_cylinder_orientation.py
+    python3 6_cylinder_orientation.py --topic /camera_left/compressed
+    python3 6_cylinder_orientation.py --weights models/best.pt --conf 0.45
 """
 
 import argparse
-import csv
 import math
-from pathlib import Path
+import re
+import threading
 
 import cv2
 import numpy as np
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSPresetProfiles
+from sensor_msgs.msg import CompressedImage
+
 from ultralytics import YOLO
 
-# ── Reuse constants from detect_node / 4_infer ──────────────────────────────
-
-CLASS_NAMES = {
-    0: "cylinder",
-    1: "peg_inactive",
-    2: "peg_lit_blue",
-    3: "peg_lit_white",
-}
-
 CYLINDER_CLASS_ID = 0
-DEFAULT_WEIGHTS = "models/best.pt"
+DEFAULT_WEIGHTS   = "models/best.pt"
+DEFAULT_TOPIC     = "/camera_left/compressed"
+MIN_MASK_PIXELS   = 50
 
-# Orientation thresholds (degrees from vertical; 0° = upright)
-UPRIGHT_MAX  = 30.0
-INVERTED_MIN = 150.0
-
-# Minimum pixels required in a mask before trusting its centroid
-MIN_MASK_PIXELS = 50
-
-# HSV ranges (OpenCV: H 0–179, S 0–255, V 0–255)
-WHITE_LOWER = np.array([  0,   0, 180], dtype=np.uint8)
-WHITE_UPPER = np.array([179,  55, 255], dtype=np.uint8)
-
-BLUE_LOWER  = np.array([ 90,  80,  40], dtype=np.uint8)
-BLUE_UPPER  = np.array([130, 255, 255], dtype=np.uint8)
-
-# Bbox colors per orientation label (BGR)
-ORIENT_COLORS = {
-    "upright":  (  0, 200,   0),  # green
-    "tilted":   (  0, 165, 255),  # orange
-    "inverted": (  0,   0, 220),  # red
-}
+# HSV thresholds (tuned via orientation_steps/params.py)
+WHITE_LOWER = np.array([  0,   0, 150], dtype=np.uint8)
+WHITE_UPPER = np.array([179, 200, 220], dtype=np.uint8)
+BLUE_LOWER  = np.array([ 80,  80,  80], dtype=np.uint8)
+BLUE_UPPER  = np.array([120, 160, 150], dtype=np.uint8)
 
 
-# ── Orientation logic ────────────────────────────────────────────────────────
+# ── Orientation helpers ───────────────────────────────────────────────────────
 
-def _mask_centroid(mask: np.ndarray):
-    """Return (x, y) centroid of a binary mask, or None if the mask is empty."""
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
+def _centroid(mask: np.ndarray):
+    """Median centre of the largest connected component, or None."""
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels < 2:
         return None
-    return float(xs.mean()), float(ys.mean())
+    areas   = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(np.argmax(areas)) + 1
+    if stats[largest, cv2.CC_STAT_AREA] < MIN_MASK_PIXELS:
+        return None
+    ys, xs = np.where(labels == largest)
+    return float(np.median(xs)), float(np.median(ys))
 
 
-def analyse_orientation(crop_bgr: np.ndarray):
+def compute_orientation(crop: np.ndarray):
     """
-    Compute cylinder orientation from a bbox crop.
+    Returns (angle_deg, blue_c, white_c, midpoint).
 
-    Strategy:
-      1. Blue mask centroid is reliable — it is dense and spatially concentrated.
-         Its vertical position (blue_y_rel) gives a coarse upright/inverted signal.
-      2. White mask is bimodal: white cylinder cap at one end PLUS white peg-board
-         background at the other end. Using the full white centroid blends both and
-         lands near blue, producing a meaningless angle.
-         Fix: restrict the white search to the crop half OPPOSITE to blue.
-         This isolates the cap and discards the background contamination.
-      3. Angle = atan2(dx, -dy) on the (white_cap → blue) vector; 0° = upright.
-
-    Returns:
-        label     : "upright" | "tilted" | "inverted"
-        angle_deg : float — 0° upright, ±180° inverted
-        blue_ratio: float — blue pixel fraction of crop area
+    Angle convention:
+        0°   = white cap directly above blue body  (upright)
+       ±180° = white cap directly below blue body  (inverted)
     """
-    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    wm  = cv2.inRange(hsv, WHITE_LOWER, WHITE_UPPER)
+    bm  = cv2.inRange(hsv, BLUE_LOWER,  BLUE_UPPER)
 
-    white_mask = cv2.inRange(hsv, WHITE_LOWER, WHITE_UPPER)
-    blue_mask  = cv2.inRange(hsv, BLUE_LOWER,  BLUE_UPPER)
+    h = crop.shape[0]
 
-    area       = crop_bgr.shape[0] * crop_bgr.shape[1]
-    blue_ratio = float(np.count_nonzero(blue_mask)) / max(area, 1)
-    crop_h     = crop_bgr.shape[0]
+    blue_c = _centroid(bm)
+    if blue_c is None:
+        return 0.0, None, None, None
 
-    blue_c = _mask_centroid(blue_mask)
-
-    if blue_c is None or np.count_nonzero(blue_mask) < MIN_MASK_PIXELS:
-        return "upright", 0.0, round(blue_ratio, 4)
-
-    blue_y_rel = blue_c[1] / crop_h   # 0 = top of crop, 1 = bottom
     split_y    = int(blue_c[1])
+    blue_y_rel = blue_c[1] / h
 
     if blue_y_rel >= 0.5:
-        # Blue in lower half → upright; look for white cap above blue centroid only
-        white_cap_mask = white_mask[:split_y, :]
-        white_cap_c    = _mask_centroid(white_cap_mask)
-        if white_cap_c is None or np.count_nonzero(white_cap_mask) < MIN_MASK_PIXELS:
-            label = "upright" if blue_y_rel > 0.6 else "tilted"
-            return label, 0.0, round(blue_ratio, 4)
-        white_c = white_cap_c                              # y already in [0, split_y]
+        white_c = _centroid(wm[:split_y, :])
     else:
-        # Blue in upper half → inverted; look for white cap below blue centroid only
-        white_cap_mask = white_mask[split_y:, :]
-        white_cap_c    = _mask_centroid(white_cap_mask)
-        if white_cap_c is None or np.count_nonzero(white_cap_mask) < MIN_MASK_PIXELS:
-            label = "inverted" if blue_y_rel < 0.4 else "tilted"
-            return label, 180.0, round(blue_ratio, 4)
-        white_c = (white_cap_c[0], white_cap_c[1] + split_y)  # restore absolute y
+        wc_rel  = _centroid(wm[split_y:, :])
+        white_c = (wc_rel[0], wc_rel[1] + split_y) if wc_rel is not None else None
 
-    # atan2(dx, -dy): 0° = white directly above blue = upright
-    dx = white_c[0] - blue_c[0]
-    dy = white_c[1] - blue_c[1]   # negative when white is above blue (upright)
-    angle_deg = math.degrees(math.atan2(dx, -dy))
+    if white_c is None:
+        return 0.0, blue_c, None, None
 
-    abs_angle = abs(angle_deg)
-    if abs_angle < UPRIGHT_MAX:
-        label = "upright"
-    elif abs_angle > INVERTED_MIN:
-        label = "inverted"
-    else:
-        label = "tilted"
+    dx = blue_c[0] - white_c[0]
+    dy = blue_c[1] - white_c[1]
+    angle_deg = math.degrees(math.atan2(dx, dy))
 
-    return label, round(angle_deg, 1), round(blue_ratio, 4)
+    midpoint = ((white_c[0] + blue_c[0]) / 2,
+                (white_c[1] + blue_c[1]) / 2)
+
+    return angle_deg, blue_c, white_c, midpoint
 
 
-# ── Drawing (mirrors detect_node._draw_detections style) ────────────────────
+def draw_orientation(crop: np.ndarray, angle_deg: float,
+                     blue_c, white_c, midpoint) -> np.ndarray:
+    """Draw axis, separator, centroids, and angle text onto a crop in-place copy."""
+    vis   = crop.copy()
+    h, w  = vis.shape[:2]
+    scale = max(h, w) * 2
 
-def draw_cylinder_box(frame, x1, y1, x2, y2, label, angle_deg, conf):
-    color = ORIENT_COLORS[label]
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    if blue_c is not None:
+        cv2.circle(vis, (int(blue_c[0]),  int(blue_c[1])),  5, (200,  30,  30), -1)
+    if white_c is not None:
+        cv2.circle(vis, (int(white_c[0]), int(white_c[1])), 5, (  0,   0, 220), -1)
 
-    text = f"{label}  {angle_deg:+.0f}deg  {conf:.2f}"
+    if white_c is not None and midpoint is not None:
+        dx     = blue_c[0] - white_c[0]
+        dy     = blue_c[1] - white_c[1]
+        length = math.hypot(dx, dy)
+        if length > 1:
+            nx, ny = dx / length, dy / length
+            p1 = (int(midpoint[0] - nx * scale), int(midpoint[1] - ny * scale))
+            p2 = (int(midpoint[0] + nx * scale), int(midpoint[1] + ny * scale))
+            cv2.line(vis, p1, p2, (0, 220, 0), 1)
+
+            px, py = -ny, nx
+            s1 = (int(midpoint[0] - px * scale), int(midpoint[1] - py * scale))
+            s2 = (int(midpoint[0] + px * scale), int(midpoint[1] + py * scale))
+            cv2.line(vis, s1, s2, (0, 165, 255), 2)
+
+    text = f"{angle_deg:+.1f}deg"
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
-    cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-    cv2.putText(
-        frame, text,
-        (x1 + 2, y1 - 4),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.50,
-        (20, 20, 20), 1, cv2.LINE_AA,
-    )
+    cv2.rectangle(vis, (2, h - th - 10), (tw + 6, h - 2), (0, 0, 0), -1)
+    cv2.putText(vis, text, (4, h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 255), 1, cv2.LINE_AA)
+
+    return vis
 
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+# ── ROS2 node ─────────────────────────────────────────────────────────────────
 
-def run(src, weights, conf, iou, imgsz, output_dir):
-    model    = YOLO(weights)
-    src_path = Path(src).expanduser()
-    out_path = Path(output_dir)
-    img_out  = out_path / "annotated"
-    img_out.mkdir(parents=True, exist_ok=True)
+class CylinderOrientationNode(Node):
+    def __init__(self, topic: str, model: YOLO, conf: float, imgsz: int):
+        safe = re.sub(r'[^a-zA-Z0-9_]', '_', topic)
+        safe = re.sub(r'_+', '_', safe).strip('_')
+        super().__init__(f"cylinder_orientation_{safe}")
 
-    image_exts = {".jpg", ".jpeg", ".png", ".bmp"}
-    if src_path.is_dir():
-        sources = sorted(p for p in src_path.iterdir() if p.suffix.lower() in image_exts)
-    else:
-        sources = [src_path]
+        self.model  = model
+        self.conf   = conf
+        self.imgsz  = imgsz
 
-    print(f"[INFO] {len(sources)} images  |  weights={weights}  |  out={out_path}")
+        self._raw_frame    = None
+        self._raw_frame_id = 0
+        self._last_infer_id   = -1
+        self._annotated_frame = None
+        self._raw_lock = threading.Lock()
+        self._ann_lock = threading.Lock()
 
-    csv_path = out_path / "orientation.csv"
-    fields   = ["image_name", "cylinder_id", "orientation", "angle_deg", "confidence", "blue_ratio"]
+        qos = QoSPresetProfiles.SENSOR_DATA.value
+        self.sub = self.create_subscription(CompressedImage, topic, self._cb, qos)
+        self.get_logger().info(f"Subscribed to {topic}")
 
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
+        self._stop        = threading.Event()
+        self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
+        self._infer_thread.start()
 
-        for img_path in sources:
-            frame = cv2.imread(str(img_path))
-            if frame is None:
-                print(f"  [WARN] cannot read {img_path.name}")
+    def _cb(self, msg: CompressedImage):
+        buf   = np.frombuffer(msg.data, dtype=np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame is None:
+            return
+        with self._raw_lock:
+            self._raw_frame    = frame
+            self._raw_frame_id += 1
+
+    def _infer_loop(self):
+        while not self._stop.is_set():
+            with self._raw_lock:
+                frame_id = self._raw_frame_id
+                frame    = self._raw_frame
+
+            if frame is None or frame_id == self._last_infer_id:
+                self._stop.wait(0.005)
+                continue
+            self._last_infer_id = frame_id
+
+            results   = self.model.predict(
+                frame, conf=self.conf, imgsz=self.imgsz,
+                classes=[CYLINDER_CLASS_ID], verbose=False,
+            )[0]
+            annotated = self._draw(frame, results)
+
+            with self._ann_lock:
+                self._annotated_frame = annotated
+
+    def _draw(self, frame: np.ndarray, results) -> np.ndarray:
+        out = frame.copy()
+        if results.boxes is None:
+            return out
+
+        h, w = frame.shape[:2]
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
                 continue
 
-            results = model.predict(
-                source=str(img_path),
-                conf=conf,
-                iou=iou,
-                imgsz=imgsz,
-                verbose=False,
-            )[0]
+            angle_deg, blue_c, white_c, midpoint = compute_orientation(crop)
+            vis_crop = draw_orientation(crop, angle_deg, blue_c, white_c, midpoint)
 
-            annotated  = frame.copy()
-            cyl_count  = 0
-            cyl_summary = []
+            out[y1:y2, x1:x2] = vis_crop
+            cv2.rectangle(out, (x1, y1), (x2, y2), (200, 200, 200), 1)
 
-            for box in results.boxes:
-                if int(box.cls[0]) != CYLINDER_CLASS_ID:
-                    continue
+        return out
 
-                det_conf        = round(float(box.conf[0]), 4)
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+    def show(self, window_name: str):
+        with self._ann_lock:
+            frame = self._annotated_frame
+        if frame is not None:
+            cv2.imshow(window_name, frame)
 
-                h, w = frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-
-                crop = frame[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
-
-                label, angle_deg, blue_ratio = analyse_orientation(crop)
-                draw_cylinder_box(annotated, x1, y1, x2, y2, label, angle_deg, det_conf)
-
-                writer.writerow({
-                    "image_name":  img_path.name,
-                    "cylinder_id": cyl_count,
-                    "orientation": label,
-                    "angle_deg":   angle_deg,
-                    "confidence":  det_conf,
-                    "blue_ratio":  blue_ratio,
-                })
-                cyl_summary.append(f"cyl{cyl_count}={label}({angle_deg:+.0f}deg)")
-                cyl_count += 1
-
-            cv2.imwrite(str(img_out / img_path.name), annotated)
-            summary = "  ".join(cyl_summary) if cyl_summary else "no cylinders"
-            print(f"  {img_path.name}: {cyl_count} cylinder(s) — {summary}")
-
-    print(f"\n[DONE] annotated images → {img_out}/")
-    print(f"       CSV             → {csv_path}")
+    def stop(self):
+        self._stop.set()
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    rclpy.init()
+    model = YOLO(args.weights)
+    print(f"[INFO] Loaded weights: {args.weights}")
+    print(f"[INFO] Topic:          {args.topic}")
+    print(f"[INFO] Confidence:     {args.conf}")
+    print(f"[INFO] Inference size: {args.imgsz}")
+    print("[INFO] Press 'q' to quit.\n")
+
+    window = "Cylinder Orientation"
+    node   = CylinderOrientationNode(args.topic, model, args.conf, args.imgsz)
+
+    executor    = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window, 640, 480)
+
+    try:
+        while rclpy.ok():
+            node.show(window)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+        cv2.destroyAllWindows()
+        executor.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--src",     required=True,              help="Image file or folder")
-    p.add_argument("--weights", default=DEFAULT_WEIGHTS,    help="YOLO .pt weights")
-    p.add_argument("--conf",    type=float, default=0.45,   help="Detection confidence threshold")
-    p.add_argument("--iou",     type=float, default=0.45,   help="NMS IoU threshold")
-    p.add_argument("--imgsz",   type=int,   default=640)
-    p.add_argument("--output",  default="runs/orientation", help="Output directory")
+    p.add_argument("--topic",   default=DEFAULT_TOPIC,   help="Compressed image topic")
+    p.add_argument("--weights", default=DEFAULT_WEIGHTS, help="YOLO .pt weights")
+    p.add_argument("--conf",    type=float, default=0.45, help="Detection confidence threshold")
+    p.add_argument("--imgsz",   type=int,   default=320,  help="YOLO inference resolution")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    run(
-        src=args.src,
-        weights=args.weights,
-        conf=args.conf,
-        iou=args.iou,
-        imgsz=args.imgsz,
-        output_dir=args.output,
-    )
+    main()
