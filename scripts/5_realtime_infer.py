@@ -2,30 +2,30 @@
 """
 Step 5 — Real-time YOLOv8 inference on dVRK camera streams.
 
-Subscribes to ROS2 camera topics, runs YOLO on each frame, and displays
-annotated results in OpenCV windows.
+Subscribes to compressed camera topics, runs YOLO on the left camera only,
+and displays bounding boxes on both left and right windows.
 
 Terminal 1 — start the dVRK + cameras:
 # however you normally start the dVRK console
 
 Terminal 2 — start the cameras (if not already started by dVRK launch):
 source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
-./camera-stream-raw.sh
+./camera-stream-compressed-transport.sh
 
 Terminal 3 — run the inference:
+source /home/stanford/ros2_yolo_venv/bin/activate
+(to deactivate: `deactivate`)
+
 source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
 cd /home/stanford/dvrk_shujiro_ws/src/dvrk_shujiro/scripts
 python3 5_realtime_infer.py
 
 Usage:
-    # Both cameras, all classes (default)
+    # Both cameras displayed, inference on left only (default)
     python3 5_realtime_infer.py
 
     # Cylinder only (faster, less noise)
     python3 5_realtime_infer.py --classes 0
-
-    # Right camera only
-    python3 5_realtime_infer.py --camera right
 
     # Smaller inference resolution for less lag
     python3 5_realtime_infer.py --imgsz 320
@@ -39,7 +39,7 @@ Usage:
 Prerequisites:
     source /opt/ros/jazzy/setup.bash
     source ~/ros2_ws/install/setup.bash
-    # Cameras must be running (camera-stream-raw.sh)
+    # Cameras must be running (camera-stream-compressed-transport.sh)
 """
 
 import argparse
@@ -51,7 +51,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSPresetProfiles
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CompressedImage, Image  # Image kept for --publish output
 
 from ultralytics import YOLO
 
@@ -173,37 +173,39 @@ class YOLOCameraNode(Node):
 
 
 # ---------------------------------------------------------------------------
-# Single inference thread shared across all camera nodes.
-# Batches all available new frames into one model.predict() call.
-def batch_infer_loop(nodes: list, model: YOLO, stop_event: threading.Event):
-    last_ids = [-1] * len(nodes)
+# Inference thread: runs YOLO only on the left camera, then draws the same
+# detections on the right camera frame (no second inference call).
+def batch_infer_loop(left_node: 'YOLOCameraNode', right_node: 'YOLOCameraNode',
+                     model: YOLO, stop_event: threading.Event):
+    last_left_id = -1
     while not stop_event.is_set():
-        frames = []
-        meta = []  # (node_index, frame_id, raw_frame)
-        for i, node in enumerate(nodes):
-            frame, fid = node.get_latest_frame()
-            if frame is not None and fid != last_ids[i]:
-                frames.append(frame)
-                meta.append((i, fid, frame))
+        left_frame, left_fid = left_node.get_latest_frame()
 
-        if not frames:
+        if left_frame is None or left_fid == last_left_id:
             stop_event.wait(0.005)
             continue
+        last_left_id = left_fid
 
         results = model.predict(
-            frames,
-            conf=nodes[0].conf,
-            imgsz=nodes[0].imgsz,
-            classes=nodes[0].classes,
+            left_frame,
+            conf=left_node.conf,
+            imgsz=left_node.imgsz,
+            classes=left_node.classes,
             verbose=False,
-        )
+        )[0]
 
-        for (i, fid, raw), result in zip(meta, results):
-            annotated = nodes[i]._draw(raw, result)
-            nodes[i].set_annotated(annotated)
-            last_ids[i] = fid
-            if nodes[i].pub is not None:
-                nodes[i]._publish(annotated)
+        annotated_left = left_node._draw(left_frame, results)
+        left_node.set_annotated(annotated_left)
+        if left_node.pub is not None:
+            left_node._publish(annotated_left)
+
+        if right_node is not None:
+            right_frame, _ = right_node.get_latest_frame()
+            if right_frame is not None:
+                annotated_right = right_node._draw(right_frame, results)
+                right_node.set_annotated(annotated_right)
+                if right_node.pub is not None:
+                    right_node._publish(annotated_right)
 
 
 # ---------------------------------------------------------------------------
@@ -219,27 +221,26 @@ def main():
     print(f"[INFO] Classes filter:   {args.classes if args.classes else 'all'}")
     print("[INFO] Press 'q' in any window to quit.\n")
 
-    if args.compressed:
-        camera_map = {
-            "left":  ("/camera_left/compressed",  "Left Camera  — YOLO"),
-            "right": ("/camera_right/compressed", "Right Camera — YOLO"),
-        }
-    else:
-        camera_map = {
-            "left":  ("/camera_left/image_raw",  "Left Camera  — YOLO"),
-            "right": ("/camera_right/image_raw", "Right Camera — YOLO"),
-        }
+    camera_map = {
+        "left":  ("/camera_left/compressed",  "Left Camera  — YOLO"),
+        "right": ("/camera_right/compressed", "Right Camera — YOLO"),
+    }
 
-    cameras = ["left", "right"] if args.camera == "both" else [args.camera]
-    nodes = []
-    for cam in cameras:
-        topic, window = camera_map[cam]
-        node = YOLOCameraNode(topic, window,
-                              args.conf, args.imgsz, args.classes, args.publish,
-                              compressed=args.compressed)
-        nodes.append(node)
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window, 640, 480)
+    # Always subscribe to both cameras; inference runs on left only.
+    left_topic,  left_window  = camera_map["left"]
+    right_topic, right_window = camera_map["right"]
+
+    left_node = YOLOCameraNode(left_topic,  left_window,
+                               args.conf, args.imgsz, args.classes, args.publish,
+                               compressed=True)
+    right_node = YOLOCameraNode(right_topic, right_window,
+                                args.conf, args.imgsz, args.classes, args.publish,
+                                compressed=True)
+    nodes = [left_node, right_node]
+
+    for n in nodes:
+        cv2.namedWindow(n.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(n.window_name, 640, 480)
 
     executor = rclpy.executors.MultiThreadedExecutor()
     for n in nodes:
@@ -250,7 +251,8 @@ def main():
 
     stop_event = threading.Event()
     infer_thread = threading.Thread(
-        target=batch_infer_loop, args=(nodes, model, stop_event), daemon=True)
+        target=batch_infer_loop, args=(left_node, right_node, model, stop_event),
+        daemon=True)
     infer_thread.start()
 
     try:
@@ -279,9 +281,6 @@ def parse_args():
                    help="YOLO inference resolution (smaller = faster, default 320)")
     p.add_argument("--classes", type=int,   nargs="+", default=None,
                    help="Class IDs to detect: 0=cylinder 1=peg_inactive 2=peg_lit_blue 3=peg_lit_white")
-    p.add_argument("--camera",     choices=["left", "right", "both"], default="both")
-    p.add_argument("--compressed", action="store_true",
-                   help="Subscribe to /compressed topics (CompressedImage) instead of /image_raw")
     p.add_argument("--publish", action="store_true",
                    help="Publish annotated frames to /camera_*/image_yolo")
     return p.parse_args()
