@@ -74,24 +74,23 @@ DEFAULT_WEIGHTS = "models/best.pt"
 
 
 # ---------------------------------------------------------------------------
-# Node that subscribes to a camera topic, runs YOLO inference in a separate thread,
+# Node that only handles ROS subscription and frame buffering.
+# Inference is done externally by a shared batch inference thread.
 class YOLOCameraNode(Node):
-    def __init__(self, topic: str, window_name: str, model: YOLO,
+    def __init__(self, topic: str, window_name: str,
                  conf: float, imgsz: int, classes: list, publish: bool,
                  compressed: bool = False):
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', window_name)
         safe = re.sub(r'_+', '_', safe).strip('_')
         super().__init__(f"yolo_{safe}")
 
-        self.model = model
         self.conf = conf
         self.imgsz = imgsz
         self.classes = classes or None
         self.window_name = window_name
 
         self._raw_frame = None
-        self._raw_frame_id = 0        # incremented on every new frame
-        self._last_infer_id = -1      # last frame id the inference thread processed
+        self._raw_frame_id = 0
         self._annotated_frame = None
         self._raw_lock = threading.Lock()
         self._ann_lock = threading.Lock()
@@ -112,12 +111,6 @@ class YOLOCameraNode(Node):
 
         self.get_logger().info(f"Subscribed to {topic}")
 
-
-        # Inference runs in its own thread so the display loop never blocks on YOLO
-        self._stop = threading.Event()
-        self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
-        self._infer_thread.start()
-
     # ------------------------------------------------------------------
     def _image_cb(self, msg: Image):
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
@@ -130,7 +123,6 @@ class YOLOCameraNode(Node):
             self._raw_frame_id += 1
 
     def _compressed_image_cb(self, msg: CompressedImage):
-        # msg.data is raw JPEG/PNG bytes — cv2.imdecode handles any format
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if frame is None:
@@ -139,44 +131,19 @@ class YOLOCameraNode(Node):
             self._raw_frame = frame
             self._raw_frame_id += 1
 
-    def _infer_loop(self):
-        # This runs in a separate thread and continuously processes the latest frame.
-        while not self._stop.is_set():
-            with self._raw_lock:
-                frame_id = self._raw_frame_id
-                frame = self._raw_frame
+    def get_latest_frame(self):
+        with self._raw_lock:
+            return self._raw_frame, self._raw_frame_id
 
-            if frame is None or frame_id == self._last_infer_id:
-                self._stop.wait(0.005)
-                continue
-            self._last_infer_id = frame_id
-
-            results = self.model.predict(
-                frame,
-                conf=self.conf,
-                imgsz=self.imgsz,
-                classes=self.classes,
-                verbose=False,
-            )[0]
-            annotated = self._draw(frame, results)
-
-            with self._ann_lock:
-                self._annotated_frame = annotated
-
-            if self.pub is not None:
-                self._publish(annotated)
+    def set_annotated(self, frame: np.ndarray):
+        with self._ann_lock:
+            self._annotated_frame = frame
 
     def show(self):
         with self._ann_lock:
             frame = self._annotated_frame
         if frame is not None:
-            # Display the annotated frame in the OpenCV window
             cv2.imshow(self.window_name, frame)
-
-    def stop(self):
-        self._stop.set()
-
-    # ------------------------------------------------------------------
 
     def _draw(self, frame: np.ndarray, results) -> np.ndarray:
         out = frame.copy()
@@ -203,6 +170,40 @@ class YOLOCameraNode(Node):
         msg.step = msg.width * 3
         msg.data = frame.tobytes()
         self.pub.publish(msg)
+
+
+# ---------------------------------------------------------------------------
+# Single inference thread shared across all camera nodes.
+# Batches all available new frames into one model.predict() call.
+def batch_infer_loop(nodes: list, model: YOLO, stop_event: threading.Event):
+    last_ids = [-1] * len(nodes)
+    while not stop_event.is_set():
+        frames = []
+        meta = []  # (node_index, frame_id, raw_frame)
+        for i, node in enumerate(nodes):
+            frame, fid = node.get_latest_frame()
+            if frame is not None and fid != last_ids[i]:
+                frames.append(frame)
+                meta.append((i, fid, frame))
+
+        if not frames:
+            stop_event.wait(0.005)
+            continue
+
+        results = model.predict(
+            frames,
+            conf=nodes[0].conf,
+            imgsz=nodes[0].imgsz,
+            classes=nodes[0].classes,
+            verbose=False,
+        )
+
+        for (i, fid, raw), result in zip(meta, results):
+            annotated = nodes[i]._draw(raw, result)
+            nodes[i].set_annotated(annotated)
+            last_ids[i] = fid
+            if nodes[i].pub is not None:
+                nodes[i]._publish(annotated)
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +234,7 @@ def main():
     nodes = []
     for cam in cameras:
         topic, window = camera_map[cam]
-        node = YOLOCameraNode(topic, window, model,
+        node = YOLOCameraNode(topic, window,
                               args.conf, args.imgsz, args.classes, args.publish,
                               compressed=args.compressed)
         nodes.append(node)
@@ -247,6 +248,11 @@ def main():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
+    stop_event = threading.Event()
+    infer_thread = threading.Thread(
+        target=batch_infer_loop, args=(nodes, model, stop_event), daemon=True)
+    infer_thread.start()
+
     try:
         while rclpy.ok():
             for node in nodes:
@@ -256,8 +262,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for node in nodes:
-            node.stop()
+        stop_event.set()
         cv2.destroyAllWindows()
         executor.shutdown()
         try:
