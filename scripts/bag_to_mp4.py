@@ -2,6 +2,10 @@
 """
 Convert a ROS2 bag to MP4 (supports both image_raw and compressed topics).
 
+Timestamps from the bag are used to drive output timing, so dropped frames
+during recording are filled by repeating the last frame — the video plays
+at true 1:1 wall-clock speed with no slowdowns or speedups.
+
 Usage:
   python3.12 -s bag_to_mp4.py <bag_dir> [output_dir]
 
@@ -9,10 +13,9 @@ Example:
   python3.12 -s bag_to_mp4.py ~/dvrk_recordings/training/testwithcv2
 
 source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && \
-  export LD_PRELOAD=/lib/x86_64-linux-gnu/libpthread.so.0 && \                                    
+  export LD_PRELOAD=/lib/x86_64-linux-gnu/libpthread.so.0 && \
   python3.12 -s ~/dvrk_shujiro_ws/src/dvrk_shujiro/scripts/bag_to_mp4.py \
     ~/dvrk_recordings/training/testwithcv2
-    
 """
 
 import sys
@@ -24,6 +27,9 @@ import rosbag2_py
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import Image, CompressedImage
 from rosidl_runtime_py.utilities import get_message
+
+
+OUT_FPS = 30.0  # output video fps; timestamps control actual motion speed
 
 
 def open_reader(bag_path):
@@ -57,12 +63,11 @@ def raw_to_bgr(msg):
         bayer = arr.reshape(msg.height, msg.width)
         return cv2.cvtColor(bayer, cv2.COLOR_BayerRG2BGR)
     else:
-        # fallback: try treating as BGR
         channels = len(msg.data) // (msg.height * msg.width)
         return arr.reshape(msg.height, msg.width, channels)
 
 
-def convert(bag_path, output_dir, fps=30.0):
+def convert(bag_path, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     cameras = {
@@ -70,7 +75,7 @@ def convert(bag_path, output_dir, fps=30.0):
         "right": ["/camera_right/image_raw",  "/camera_right/compressed"],
     }
 
-    # First pass: figure out which topics exist and their types
+    # First pass: find which topics exist
     reader = open_reader(bag_path)
     types  = topic_type_map(reader)
     del reader
@@ -89,27 +94,39 @@ def convert(bag_path, output_dir, fps=30.0):
         print("No camera topics found in bag.")
         sys.exit(1)
 
-    # Second pass: read frames and write MP4
-    writers = {}
+    out_dt_ns = int(1e9 / OUT_FPS)
 
+    # Per-camera state for timestamp-based rendering
+    writers  = {}
+    last_frm = {cam: None for cam in active}
+    next_out = {cam: None for cam in active}  # next output slot (nanoseconds)
+    counts   = {cam: 0    for cam in active}
+
+    def flush_to(cam, t_end_ns):
+        """Repeat last_frm[cam] for every output slot before t_end_ns."""
+        if last_frm[cam] is None or next_out[cam] is None:
+            return
+        while next_out[cam] < t_end_ns:
+            writers[cam].write(last_frm[cam])
+            counts[cam] += 1
+            next_out[cam] += out_dt_ns
+
+    # Second pass: stream frames, filling gaps with repeated frames
     reader = open_reader(bag_path)
-    filter_ = rosbag2_py.StorageFilter(topics=list(t for t, _ in active.values()))
-    reader.set_filter(filter_)
-
-    counts = {cam: 0 for cam in active}
+    reader.set_filter(rosbag2_py.StorageFilter(topics=[t for t, _ in active.values()]))
 
     while reader.has_next():
-        topic, data, _ = reader.read_next()
+        topic, data, t_bag = reader.read_next()
 
         for cam, (active_topic, type_str) in active.items():
             if topic != active_topic:
                 continue
 
             msg_type = get_message(type_str)
-            msg = deserialize_message(data, msg_type)
+            msg      = deserialize_message(data, msg_type)
 
             if "CompressedImage" in type_str:
-                buf = np.frombuffer(msg.data, dtype=np.uint8)
+                buf   = np.frombuffer(msg.data, dtype=np.uint8)
                 frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
             else:
                 frame = raw_to_bgr(msg)
@@ -119,19 +136,29 @@ def convert(bag_path, output_dir, fps=30.0):
 
             if cam not in writers:
                 h, w = frame.shape[:2]
-                out_path = os.path.join(output_dir, f"{cam}.mp4")
+                out_path    = os.path.join(output_dir, f"{cam}.mp4")
                 writers[cam] = cv2.VideoWriter(
-                    out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h)
+                    out_path, cv2.VideoWriter_fourcc(*"mp4v"), OUT_FPS, (w, h)
                 )
-                print(f"  Writing {cam}.mp4  ({w}x{h} @ {fps} fps)")
+                next_out[cam] = t_bag
+                print(f"  Writing {cam}.mp4  ({w}x{h} @ {OUT_FPS} fps)")
 
-            writers[cam].write(frame)
+            # Fill all output slots before this frame's arrival with the previous frame
+            flush_to(cam, t_bag)
+
+            # Park the new frame — it will be written when the next frame arrives
+            last_frm[cam] = frame
+
+    # Write the final frame once for each camera
+    for cam in active:
+        if cam in writers and last_frm[cam] is not None:
+            writers[cam].write(last_frm[cam])
             counts[cam] += 1
 
     for cam, writer in writers.items():
         writer.release()
         out_path = os.path.join(output_dir, f"{cam}.mp4")
-        size = os.path.getsize(out_path) / 1e6
+        size     = os.path.getsize(out_path) / 1e6
         print(f"  {cam}.mp4  — {counts[cam]} frames, {size:.1f} MB")
 
     print("Done.")

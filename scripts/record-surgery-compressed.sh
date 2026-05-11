@@ -42,10 +42,7 @@ echo "Press Ctrl+C to stop recording"
 echo ""
 
 ros2 bag record -o "$NAME" --topics \
-  /camera_left/image_raw \
-  /camera_right/image_raw \
-  /camera_left/camera_info \
-  /camera_right/camera_info \
+  /camera_left/compressed \
   /PSM1/measured_cp \
   /PSM2/measured_cp \
   /ECM/measured_cp
