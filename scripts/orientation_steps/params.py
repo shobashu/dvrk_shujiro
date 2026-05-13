@@ -9,7 +9,8 @@ _SCRIPTS = _HERE.parent            # scripts/
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 SRC     = str(Path.home() / "data_shujiro/Task_Pad_Cylinder_Pegs_yolov8/train/images")
-WEIGHTS = str(_SCRIPTS / "models/best.pt")
+# WEIGHTS = str(_SCRIPTS / "models/best.pt")
+WEIGHTS = str(_SCRIPTS / "models/best_v2.pt")  
 CONF    = 0.45
 IOU     = 0.45
 IMGSZ   = 640
@@ -19,7 +20,7 @@ OUT_ROOT = str(_SCRIPTS / "runs/orientation_steps")
 
 # ── Quick-test limiter ────────────────────────────────────────────────────────
 # Set to a small number while tuning (e.g. 4), None to process all crops.
-SAMPLE = 4
+SAMPLE = 10
 
 # ── HSV thresholds ────────────────────────────────────────────────────────────
 # OpenCV scale: H 0–179, S 0–255, V 0–255
@@ -37,9 +38,9 @@ SAMPLE = 4
 # BLUE_S_MIN,  BLUE_S_MAX  =  100, 170   # medium-high saturation
 # BLUE_V_MIN,  BLUE_V_MAX  =  40, 255   # any brightness (handles shadows)
 
-WHITE_H_MIN, WHITE_H_MAX =   0, 179   # white has no dominant hue → keep full range
-WHITE_S_MIN, WHITE_S_MAX =   0, 200   # low saturation  → white/grey
-WHITE_V_MIN, WHITE_V_MAX = 150, 220   # high brightness → white
+WHITE_H_MIN, WHITE_H_MAX =   0,80   # white has no dominant hue → keep full range
+WHITE_S_MIN, WHITE_S_MAX =   0, 80   # low saturation  → white/grey
+WHITE_V_MIN, WHITE_V_MAX = 170, 250   # high brightness → white
 
 BLUE_H_MIN,  BLUE_H_MAX  =  80, 120   # blue hue range
 BLUE_S_MIN,  BLUE_S_MAX  =  80, 160   # medium-high saturation

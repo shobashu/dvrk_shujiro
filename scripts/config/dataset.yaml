@@ -1,0 +1,7 @@
+path: /home/cfxuser/dvrk_shujiro/scripts/data/dataset_v2
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 4
+names: ['cylinder', 'peg_inactive', 'peg_lit_blue', 'peg_lit_white']
