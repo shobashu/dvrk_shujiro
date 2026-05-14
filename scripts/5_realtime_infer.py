@@ -70,7 +70,7 @@ CLASS_COLORS = {
     3: (255, 255,   0), # yellow
 }
 
-DEFAULT_WEIGHTS = "models/best.pt"
+DEFAULT_WEIGHTS = "models/best_v2.pt"
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +276,7 @@ def main():
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default=DEFAULT_WEIGHTS)
-    p.add_argument("--conf",    type=float, default=0.5)
+    p.add_argument("--conf",    type=float, default=0.3)
     p.add_argument("--imgsz",   type=int,   default=320,
                    help="YOLO inference resolution (smaller = faster, default 320)")
     p.add_argument("--classes", type=int,   nargs="+", default=None,

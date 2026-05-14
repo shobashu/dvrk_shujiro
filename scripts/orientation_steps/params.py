@@ -30,21 +30,21 @@ SAMPLE = 10
 #   • What S value separates white (low S) from coloured areas
 #   • What V value the white cap has  (expect >180)
 
-# WHITE_H_MIN, WHITE_H_MAX =   0, 179   # white has no dominant hue → keep full range
-# WHITE_S_MIN, WHITE_S_MAX =   0,  55   # low saturation  → white/grey
-# WHITE_V_MIN, WHITE_V_MAX = 180, 255   # high brightness → white
+# WHITE_H_MIN, WHITE_H_MAX =    0, 27                         # white has no dominant hue → keep full range
+# WHITE_S_MIN, WHITE_S_MAX =    0, 128              # low saturation  → white/grey
+# WHITE_V_MIN, WHITE_V_MAX =   85, 255              # high brightness → white
 
-# BLUE_H_MIN,  BLUE_H_MAX  =  90, 130   # blue hue range
-# BLUE_S_MIN,  BLUE_S_MAX  =  100, 170   # medium-high saturation
-# BLUE_V_MIN,  BLUE_V_MAX  =  40, 255   # any brightness (handles shadows)
+# BLUE_H_MIN, BLUE_H_MAX =   97, 129              # blue hue range
+# BLUE_S_MIN, BLUE_S_MAX =   81, 168              # medium-high saturation
+# BLUE_V_MIN, BLUE_V_MAX =    0, 255              # any brightness (handles shadows)
 
-WHITE_H_MIN, WHITE_H_MAX =   0,80   # white has no dominant hue → keep full range
-WHITE_S_MIN, WHITE_S_MAX =   0, 80   # low saturation  → white/grey
-WHITE_V_MIN, WHITE_V_MAX = 170, 250   # high brightness → white
+WHITE_H_MIN, WHITE_H_MAX =    0, 27                         # white has no dominant hue → keep full range
+WHITE_S_MIN, WHITE_S_MAX =    0, 128              # low saturation  → white/grey
+WHITE_V_MIN, WHITE_V_MAX =   85, 255              # high brightness → white
 
-BLUE_H_MIN,  BLUE_H_MAX  =  80, 120   # blue hue range
-BLUE_S_MIN,  BLUE_S_MAX  =  80, 160   # medium-high saturation
-BLUE_V_MIN,  BLUE_V_MAX  =  80, 150   # any brightness (handles shadows)
+BLUE_H_MIN, BLUE_H_MAX =   97, 129              # blue hue range
+BLUE_S_MIN, BLUE_S_MAX =   81, 168              # medium-high saturation
+BLUE_V_MIN, BLUE_V_MAX =    0, 255              # any brightness (handles shadows)
 
 # ── Classification thresholds (step 5) ───────────────────────────────────────
 # boundary_y_rel = blue centroid row / crop height   (0 = top, 1 = bottom)
