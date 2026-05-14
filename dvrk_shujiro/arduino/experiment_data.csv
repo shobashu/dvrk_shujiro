@@ -102,3 +102,5 @@ Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
 6,2,Blue,1777576486.273,1777576490.993,1777576496.653
 7,7,White,1777576506.323,1777576509.743,1777576522.823
 8,4,Blue,1777576534.803,1777576537.543,1777576542.653
+Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
+Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
