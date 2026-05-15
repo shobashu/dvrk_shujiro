@@ -27,6 +27,9 @@ Usage:
     # Cylinder only (faster, less noise)
     python3 5_realtime_infer.py --classes 0
 
+    # cylinder, peg_lit_blue and peg_lit_white (ignore unlit pegs)
+    python3 5_realtime_infer.py --classes 0 2 3
+
     # Smaller inference resolution for less lag
     python3 5_realtime_infer.py --imgsz 320
 
@@ -43,8 +46,13 @@ Prerequisites:
 """
 
 import argparse
+import csv
+import os
+import queue
 import re
+import sys
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -54,6 +62,11 @@ from rclpy.qos import QoSPresetProfiles
 from sensor_msgs.msg import CompressedImage, Image  # Image kept for --publish output
 
 from ultralytics import YOLO
+
+# Allow importing read_arduino from the arduino package directory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'dvrk_shujiro', 'arduino'))
+from read_arduino import arduino_loop
 
 # 4 objects classes
 CLASS_NAMES = {
@@ -71,6 +84,30 @@ CLASS_COLORS = {
 }
 
 DEFAULT_WEIGHTS = "models/best_v2.pt"
+
+# Classes considered "the target peg" (lit pegs)
+_LIT_PEG_CLASSES = {2, 3}  # peg_lit_blue, peg_lit_white
+_BBOX_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lifted_peg_bboxes.csv")
+
+
+def _save_target_peg_bbox(results):
+    """On a LIFTED signal, find the lit peg in the last YOLO results and append to CSV."""
+    target_boxes = [b for b in results.boxes if int(b.cls[0]) in _LIT_PEG_CLASSES]
+    if not target_boxes:
+        print("[LIFTED] No lit peg in last frame — bbox not saved.")
+        return
+    box = target_boxes[0]
+    cls_id = int(box.cls[0])
+    x1, y1, x2, y2 = map(int, box.xyxy[0])
+    conf = float(box.conf[0])
+    write_header = not os.path.exists(_BBOX_CSV)
+    with open(_BBOX_CSV, "a", newline="") as f:
+        w = csv.writer(f)
+        if write_header:
+            w.writerow(["unix_time", "class_id", "class_name", "x1", "y1", "x2", "y2", "conf"])
+        w.writerow([f"{time.time():.3f}", cls_id, CLASS_NAMES[cls_id],
+                    x1, y1, x2, y2, f"{conf:.3f}"])
+    print(f"[LIFTED] Saved bbox: {CLASS_NAMES[cls_id]} ({x1},{y1})-({x2},{y2}) conf={conf:.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +213,23 @@ class YOLOCameraNode(Node):
 # Inference thread: runs YOLO only on the left camera, then draws the same
 # detections on the right camera frame (no second inference call).
 def batch_infer_loop(left_node: 'YOLOCameraNode', right_node: 'YOLOCameraNode',
-                     model: YOLO, stop_event: threading.Event):
+                     model: YOLO, stop_event: threading.Event,
+                     lifted_queue: queue.Queue = None):
     last_left_id = -1
+    last_results = None
     while not stop_event.is_set():
+        # Check for LIFTED signal from Arduino (non-blocking)
+        if lifted_queue is not None:
+            try:
+                msg = lifted_queue.get_nowait()
+                if msg == "LIFTED":
+                    if last_results is not None:
+                        _save_target_peg_bbox(last_results)
+                    else:
+                        print("[LIFTED] No inference results yet — bbox not saved.")
+            except queue.Empty:
+                pass
+
         left_frame, left_fid = left_node.get_latest_frame()
 
         if left_frame is None or left_fid == last_left_id:
@@ -193,6 +244,7 @@ def batch_infer_loop(left_node: 'YOLOCameraNode', right_node: 'YOLOCameraNode',
             classes=left_node.classes,
             verbose=False,
         )[0]
+        last_results = results
 
         annotated_left = left_node._draw(left_frame, results)
         left_node.set_annotated(annotated_left)
@@ -250,8 +302,19 @@ def main():
     spin_thread.start()
 
     stop_event = threading.Event()
+
+    lifted_queue = None
+    if args.arduino:
+        lifted_queue = queue.Queue()
+        arduino_thread = threading.Thread(
+            target=arduino_loop, args=(lifted_queue, stop_event),
+            daemon=True)
+        arduino_thread.start()
+        print(f"[INFO] Arduino thread started. Bboxes saved to: {_BBOX_CSV}")
+
     infer_thread = threading.Thread(
-        target=batch_infer_loop, args=(left_node, right_node, model, stop_event),
+        target=batch_infer_loop,
+        args=(left_node, right_node, model, stop_event, lifted_queue),
         daemon=True)
     infer_thread.start()
 
@@ -276,13 +339,15 @@ def main():
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--weights", default=DEFAULT_WEIGHTS)
-    p.add_argument("--conf",    type=float, default=0.6)
+    p.add_argument("--conf",    type=float, default=0.5)
     p.add_argument("--imgsz",   type=int,   default=320,
                    help="YOLO inference resolution (smaller = faster, default 320)")
     p.add_argument("--classes", type=int,   nargs="+", default=None,
                    help="Class IDs to detect: 0=cylinder 1=peg_inactive 2=peg_lit_blue 3=peg_lit_white")
     p.add_argument("--publish", action="store_true",
                    help="Publish annotated frames to /camera_*/image_yolo")
+    p.add_argument("--arduino", action="store_true",
+                   help="Enable Arduino serial reader; saves lit-peg bbox to CSV on LIFTED signal")
     return p.parse_args()
 
 
