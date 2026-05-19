@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m py_compile scripts/7_velocity_check.py)"
+      "Bash(python -m py_compile scripts/7_velocity_check.py)",
+      "Bash(python3 *)"
     ]
   }
 }

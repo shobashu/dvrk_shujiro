@@ -1,0 +1,15 @@
+digraph G {
+"HRSV" -> "MTMR"[label=" Broadcaster: default_authority\nAverage rate: 50.072\nBuffer length: 4.993\nMost recent transform: 1779226137.920204\nOldest transform: 1779226132.927441\n"];
+"HRSV" -> "MTML"[label=" Broadcaster: default_authority\nAverage rate: 50.053\nBuffer length: 4.995\nMost recent transform: 1779226137.925484\nOldest transform: 1779226132.930738\n"];
+"ECM" -> "PSM1"[label=" Broadcaster: default_authority\nAverage rate: 50.073\nBuffer length: 4.993\nMost recent transform: 1779226137.932673\nOldest transform: 1779226132.939957\n"];
+"Cart" -> "ECM"[label=" Broadcaster: default_authority\nAverage rate: 50.073\nBuffer length: 4.993\nMost recent transform: 1779226137.924752\nOldest transform: 1779226132.932057\n"];
+"ECM" -> "PSM2"[label=" Broadcaster: default_authority\nAverage rate: 50.071\nBuffer length: 4.973\nMost recent transform: 1779226137.914227\nOldest transform: 1779226132.94129\n"];
+"Cart" -> "ECM_base"[label=" Broadcaster: default_authority\nAverage rate: 3.529\nBuffer length: 4.817\nMost recent transform: 1779226137.634043\nOldest transform: 1779226132.817018\n"];
+"ECM" -> "PSM3_base"[label=" Broadcaster: default_authority\nAverage rate: 10000.0\nBuffer length: 0.0\nMost recent transform: 0.0\nOldest transform: 0.0\n"];
+"ECM" -> "PSM1_base"[label=" Broadcaster: default_authority\nAverage rate: 3.529\nBuffer length: 4.817\nMost recent transform: 1779226137.634045\nOldest transform: 1779226132.817018\n"];
+"ECM" -> "PSM2_base"[label=" Broadcaster: default_authority\nAverage rate: 3.529\nBuffer length: 4.817\nMost recent transform: 1779226137.634044\nOldest transform: 1779226132.817018\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1779226137.936993"[ shape=plaintext ] ;
+}->"Cart";
+}
