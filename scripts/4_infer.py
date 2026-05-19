@@ -19,6 +19,7 @@ Usage:
 import argparse
 from pathlib import Path
 
+import cv2
 from ultralytics import YOLO
 
 CLASS_NAMES = {
@@ -28,8 +29,17 @@ CLASS_NAMES = {
     3: "peg_lit_white",
 }
 
-DEFAULT_WEIGHTS = "runs/detect/models/dvrk_v1-2/weights/best.pt"
+# BGR colors per class — no labels drawn, only colored boxes
+CLASS_COLORS = {
+    0: (0,   200,   0),   # cylinder      → green
+    1: (128, 128, 128),   # peg_inactive  → gray
+    2: (139,   0,   0),   # peg_lit_blue  → dark blue
+    3: (0,   100,   0),   # peg_lit_white → dark green
+}
 
+# DEFAULT_WEIGHTS = "runs/detect/models/dvrk_v1-2/weights/best.pt"
+# or 
+DEFAULT_WEIGHTS = "models/best_v2.pt"  # copy of the above with a simpler name
 
 def infer(
     src: str,
@@ -54,35 +64,49 @@ def infer(
     else:
         sources = [str(src_path)]
 
+    out_dir = Path(output_dir) / "results"
+    if save:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
     results = model.predict(
         source=sources,
         conf=conf,
         iou=iou,
         imgsz=imgsz,
-        save=save,
-        show=show,
-        project=output_dir,
-        name="results",
-        exist_ok=True,
+        save=False,      # we draw boxes manually
         verbose=False,
     )
 
-    # Print per-image summary
     for r in results:
         img_name = Path(r.path).name
+        img      = cv2.imread(r.path)
+
         boxes = r.boxes
         if boxes is None or len(boxes) == 0:
             print(f"  {img_name}: no detections")
-            continue
-        counts = {}
-        for cls_id in boxes.cls.tolist():
-            name = CLASS_NAMES.get(int(cls_id), str(int(cls_id)))
-            counts[name] = counts.get(name, 0) + 1
-        summary = ", ".join(f"{v}x {k}" for k, v in counts.items())
-        print(f"  {img_name}: {summary}")
+        else:
+            counts = {}
+            for box in boxes:
+                cls_id = int(box.cls[0])
+                color  = CLASS_COLORS.get(cls_id, (255, 255, 255))
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                name = CLASS_NAMES.get(cls_id, str(cls_id))
+                counts[name] = counts.get(name, 0) + 1
 
+            summary = ", ".join(f"{v}x {k}" for k, v in counts.items())
+            print(f"  {img_name}: {summary}")
+
+        if save:
+            cv2.imwrite(str(out_dir / img_name), img)
+        if show:
+            cv2.imshow("inference", img)
+            cv2.waitKey(1)
+
+    if show:
+        cv2.destroyAllWindows()
     if save:
-        print(f"\n[DONE] Results saved to {output_dir}/results/")
+        print(f"\n[DONE] Results saved to {out_dir}/")
 
 
 def parse_args():

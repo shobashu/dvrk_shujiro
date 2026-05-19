@@ -21,6 +21,7 @@ Model size guide:
 """
 
 import argparse
+import shutil
 from pathlib import Path
 
 import yaml
@@ -31,14 +32,14 @@ from ultralytics import YOLO
 # Edit these defaults before running, or override with CLI flags.
 
 DEFAULT_CONFIG = {
-    "model":   "yolov8n.pt",   # base weights (downloaded automatically if absent)
+    "model":   "yolov8s.pt",   # base weights (downloaded automatically if absent)
     "data":    "config/dataset.yaml",
-    "epochs":  80,
+    "epochs":  100,
     "imgsz":   640,
     "batch":   16,
     "device":  "",             # "" = auto (GPU if available, else CPU)
     "project": "models",
-    "name":    "dvrk_v1",
+    "name":    "dvrk_v2",
 }
 
 # Augmentations tuned for endoscope / LED peg-transfer footage
@@ -101,7 +102,7 @@ def step3_train(model: YOLO, cfg: dict) -> str:
     print(f"  Output : {cfg['project']}/{cfg['name']}/")
     print()
 
-    model.train(
+    results = model.train(
         data=cfg["data"],
         epochs=cfg["epochs"],
         imgsz=cfg["imgsz"],
@@ -121,7 +122,7 @@ def step3_train(model: YOLO, cfg: dict) -> str:
         verbose=True,
     )
 
-    best = str(Path(cfg["project"]) / cfg["name"] / "weights" / "best.pt")
+    best = str(Path(results.save_dir) / "weights" / "best.pt")
     return best
 
 
@@ -149,9 +150,13 @@ def step4_evaluate(weights_path: str, data_yaml: str):
 # ── STEP 5 — Report ─────────────────────────────────────────────────────────────
 
 def step5_report(best_weights: str):
+    best_src = Path(best_weights)
+    named    = Path("models") / "best_v2.pt"
+    shutil.copy2(best_src, named)
+
     print(f"\nSTEP 5 — Done")
-    print(f"  Best weights saved to: {best_weights}")
-    print(f"  Copy to the dVRK machine and update models/dvrk_v1/weights/best.pt")
+    print(f"  Best weights : {best_weights}")
+    print(f"  Named copy   : {named}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────

@@ -10,6 +10,12 @@ STEP 3 — Auto-label raw frames using best.pt
 STEP 4 — Merge all pairs and split into train / val / test
 STEP 5 — Write config/dataset.yaml
 
+BEFORE RUNNING: 
+Do not forget to run the fix_labels.py script
+    python3 fix_labels.py --labels data/dataset_v2/labels/train                      
+    python3 fix_labels.py --labels data/dataset_v2/labels/val                        
+    python3 fix_labels.py --labels data/dataset_v2/labels/test  
+
 Usage:
     python scripts/2_prepare_dataset.py \
         --labeled  Task_Pad_cylinder_pegs.yolov8.zip \
@@ -73,12 +79,18 @@ def find_label(img: Path) -> Path | None:
     return None
 
 
-# ── STEP 1 — Unzip ──────────────────────────────────────────────────────────────
+# ── STEP 1 — Unzip (or pass through if already a directory) ─────────────────────
+
+def _extract(path: Path, work: Path) -> Path:
+    if path.is_dir():
+        return path
+    return unzip(path, work)
+
 
 def step1_unzip(labeled_zip: Path, frames_zip: Path, work: Path):
-    print("\nSTEP 1 — Unzipping archives")
-    labeled_root = unzip(labeled_zip, work)
-    frames_root  = unzip(frames_zip,  work)
+    print("\nSTEP 1 — Locating data")
+    labeled_root = _extract(labeled_zip, work)
+    frames_root  = _extract(frames_zip,  work)
     print(f"  Labeled data : {labeled_root}")
     print(f"  Raw frames   : {frames_root}")
     return labeled_root, frames_root
@@ -218,9 +230,9 @@ def step5_write_yaml(dst: Path):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--labeled",  required=True,
-                   help="Path to Task_Pad_cylinder_pegs.yolov8.zip")
-    p.add_argument("--frames",   required=True,
-                   help="Path to remaining_frames.zip")
+                   help="Path to labeled zip or directory (Roboflow export)")
+    p.add_argument("--frames",   default=None,
+                   help="Path to remaining_frames zip or directory for auto-labeling (optional)")
     p.add_argument("--weights",  default="models/dvrk_v1/weights/best.pt",
                    help="YOLO weights used for auto-labeling")
     p.add_argument("--out",      default="data/dataset",
@@ -242,11 +254,17 @@ def main():
     out  = Path(args.out)
     work.mkdir(parents=True, exist_ok=True)
 
-    labeled_root, frames_root = step1_unzip(
-        Path(args.labeled), Path(args.frames), work
-    )
+    labeled_root = _extract(Path(args.labeled), work)
+    print(f"\nSTEP 1 — Labeled data : {labeled_root}")
     labeled_pairs = step2_collect_labeled(labeled_root)
-    auto_pairs    = step3_auto_label(frames_root, Path(args.weights), work, args.conf)
+
+    if args.frames:
+        frames_root = _extract(Path(args.frames), work)
+        auto_pairs  = step3_auto_label(frames_root, Path(args.weights), work, args.conf)
+    else:
+        print("\nSTEP 3 — Skipped (no --frames provided)")
+        auto_pairs = []
+
     splits        = step4_merge_and_split(
         labeled_pairs, auto_pairs, out, tuple(args.split), args.seed
     )

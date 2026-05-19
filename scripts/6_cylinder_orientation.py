@@ -33,30 +33,47 @@ from sensor_msgs.msg import CompressedImage
 from ultralytics import YOLO
 
 CYLINDER_CLASS_ID = 0
-DEFAULT_WEIGHTS   = "models/best.pt"
+DEFAULT_WEIGHTS   = "models/best_v2.pt"
 DEFAULT_TOPIC     = "/camera_left/compressed"
 MIN_MASK_PIXELS   = 50
 
 # HSV thresholds (tuned via orientation_steps/params.py)
-WHITE_LOWER = np.array([  0,   0, 150], dtype=np.uint8)
-WHITE_UPPER = np.array([179, 200, 220], dtype=np.uint8)
-BLUE_LOWER  = np.array([ 80,  80,  80], dtype=np.uint8)
-BLUE_UPPER  = np.array([120, 160, 150], dtype=np.uint8)
+WHITE_LOWER = np.array([  0,   0, 85], dtype=np.uint8)
+WHITE_UPPER = np.array([ 27, 128, 255], dtype=np.uint8)
+BLUE_LOWER  = np.array([ 97,  81,   0], dtype=np.uint8)
+BLUE_UPPER  = np.array([129, 168, 255], dtype=np.uint8)
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
 def _centroid(mask: np.ndarray):
-    """Median centre of the largest connected component, or None."""
+    """Area-weighted centroid across all significant blobs, or None.
+
+    Using all blobs (not just the largest) handles the case where an occluder
+    splits a colour region into two parts (e.g. blue visible on left and right
+    but hidden in the middle): the weighted average lands at the true centre.
+    """
+    if mask.size == 0:
+        return None
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels < 2:
         return None
-    areas   = stats[1:, cv2.CC_STAT_AREA]
-    largest = int(np.argmax(areas)) + 1
-    if stats[largest, cv2.CC_STAT_AREA] < MIN_MASK_PIXELS:
+
+    total_x = total_y = total_w = 0.0
+    for lbl in range(1, num_labels):          # skip label 0 (background)
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if area < MIN_MASK_PIXELS:
+            continue
+        M = cv2.moments((labels == lbl).astype(np.uint8) * 255)
+        if M["m00"] == 0:
+            continue
+        total_x += (M["m10"] / M["m00"]) * area
+        total_y += (M["m01"] / M["m00"]) * area
+        total_w += area
+
+    if total_w == 0:
         return None
-    ys, xs = np.where(labels == largest)
-    return float(np.median(xs)), float(np.median(ys))
+    return total_x / total_w, total_y / total_w
 
 
 def compute_orientation(crop: np.ndarray):
@@ -77,14 +94,9 @@ def compute_orientation(crop: np.ndarray):
     if blue_c is None:
         return 0.0, None, None, None
 
-    split_y    = int(blue_c[1])
-    blue_y_rel = blue_c[1] / h
-
-    if blue_y_rel >= 0.5:
-        white_c = _centroid(wm[:split_y, :])
-    else:
-        wc_rel  = _centroid(wm[split_y:, :])
-        white_c = (wc_rel[0], wc_rel[1] + split_y) if wc_rel is not None else None
+    # White only appears on one side of the cylinder (task pad guarantees this),
+    # so search the full mask — no split needed.
+    white_c = _centroid(wm)
 
     if white_c is None:
         return 0.0, blue_c, None, None
