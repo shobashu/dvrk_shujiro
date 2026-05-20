@@ -8,7 +8,8 @@ and classifies each frame into one of three states:
 
     STATIONARY — cylinder still (velocity < --vel-stat)
     HELD       — smooth controlled motion (between --vel-stat and --vel-drop)
-    DROPPED    — sudden velocity spike, or tracking lost while held
+    DROPPED    — sudden velocity spike
+    LOST       — cylinder not visible for >= --lost consecutive frames
 
 On every state change a line is printed to stdout, e.g.:
     [12:34:56.789] HELD -> DROPPED  vel=73.2px/s  pos=(312,240)
@@ -43,11 +44,13 @@ DEFAULT_TOPIC     = "/camera_left/compressed"
 STATE_STATIONARY = "STATIONARY"
 STATE_HELD       = "HELD"
 STATE_DROPPED    = "DROPPED"
+STATE_LOST       = "LOST"
 
 STATE_COLORS = {
     STATE_STATIONARY: (200, 200, 200),
     STATE_HELD:       (0,   220, 0),
     STATE_DROPPED:    (0,    30, 255),
+    STATE_LOST:       (0,   165, 255),
 }
 
 SPARK_W      = 150
@@ -74,7 +77,7 @@ def _stamp() -> str:
     now = time.time()
     return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int((now % 1) * 1000):03d}"
 
-
+# live camera view
 def draw_sparkline(frame: np.ndarray, samples, vel_drop: float):
     """Draw a velocity sparkline in the bottom-left corner, in-place."""
     h = frame.shape[0]
@@ -190,7 +193,7 @@ def draw_velocity_plot(plot_hist, vel_stat: float, vel_drop: float,
 
     return canvas
 
-
+# use it by running "--mode dist"
 def draw_distribution_plot(displacements: list) -> np.ndarray:
     """Render a live histogram of raw per-frame pixel displacements (no dt division)."""
     PAD_L, PAD_B, PAD_R, PAD_T = 58, 46, 16, 35
@@ -264,7 +267,7 @@ class CylinderVelocityNode(Node):
     def __init__(self, topic: str, model: YOLO, conf: float, imgsz: int,
                  vel_stat: float, vel_drop: float, lost_frames: int,
                  vel_window: int, spike_frames: int, settle_frames: int,
-                 max_jump: float, log_path):
+                 max_jump: float, drop_timeout: float, log_path):
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', topic)
         safe = re.sub(r'_+', '_', safe).strip('_')
         super().__init__(f"cylinder_velocity_{safe}")
@@ -287,6 +290,7 @@ class CylinderVelocityNode(Node):
 
         self.spike_frames  = spike_frames
         self.settle_frames = settle_frames
+        self.drop_timeout  = drop_timeout
 
         # state machine (lives entirely in the inference thread)
         self._state        = STATE_STATIONARY
@@ -296,6 +300,7 @@ class CylinderVelocityNode(Node):
         self._spike_count  = 0   # consecutive frames above vel_drop
         self._settle_count = 0   # consecutive frames below vel_stat
         self._event_count  = 0
+        self._dropped_at   = None  # wall-clock time when DROPPED was entered
         self._vel_hist     = deque(maxlen=vel_window)
         self._spark_hist   = deque(maxlen=SPARK_SAMPLES)
         self._plot_hist    = deque(maxlen=2000)  # (abs_time, smoothed_vel, state)
@@ -320,6 +325,7 @@ class CylinderVelocityNode(Node):
         self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         self._infer_thread.start()
 
+    # called whenever a new camera frame arrives (~30 fps)
     def _cb(self, msg: CompressedImage):
         buf   = np.frombuffer(msg.data, dtype=np.uint8)
         frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
@@ -329,6 +335,7 @@ class CylinderVelocityNode(Node):
             self._raw_frame    = frame
             self._raw_frame_id += 1
 
+    # runs in a background thread
     def _infer_loop(self):
         while not self._stop.is_set():
             with self._raw_lock:
@@ -367,6 +374,7 @@ class CylinderVelocityNode(Node):
         x1, y1, x2, y2 = best
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0, x1, y1, x2, y2
 
+    # handles state transitions 
     def _set_state(self, new_state: str, vel: float, center):
         if new_state == self._state:
             return
@@ -376,7 +384,9 @@ class CylinderVelocityNode(Node):
         print(f"[{_stamp()}] {self._state} -> {new_state}  "
               f"disp={vel:.1f}px  pos=({cx},{cy})")
         self._state = new_state
+        self._dropped_at = time.time() if new_state == STATE_DROPPED else None
 
+    # state machine, called every frame
     def _process(self, frame: np.ndarray, results) -> np.ndarray:
         out  = frame.copy()
         h, w = frame.shape[:2]
@@ -385,13 +395,12 @@ class CylinderVelocityNode(Node):
         det = self._largest_box(results, w, h)
 
         if det is None:
-            # tracking loss: a sustained miss after a hold counts as a drop
             self._lost_count  += 1
             self._spike_count  = 0
             self._settle_count = 0
             if (self._lost_count >= self.lost_frames
-                    and self._state in (STATE_HELD, STATE_DROPPED)):
-                self._set_state(STATE_DROPPED, 0.0, None)
+                    and self._state != STATE_LOST):
+                self._set_state(STATE_LOST, 0.0, None)
             self._prev_center = None
             self._prev_time   = None
             smoothed = self._vel_hist[-1] if self._vel_hist else 0.0
@@ -444,13 +453,17 @@ class CylinderVelocityNode(Node):
             self._set_state(STATE_DROPPED, raw_disp, center)
             self._spike_count = 0
         elif self._state == STATE_DROPPED:
-            # re-acquired after a drop → wait for full settle before resetting
-            if self._settle_count >= self.settle_frames:
+            # exit via settle OR via timeout (cylinder stopped bouncing)
+            timed_out = (self._dropped_at is not None and
+                         now - self._dropped_at >= self.drop_timeout)
+            if self._settle_count >= self.settle_frames or timed_out:
                 self._set_state(STATE_STATIONARY, smoothed, center)
+        elif self._state == STATE_LOST:
+            # cylinder re-appeared → go to HELD immediately, settle to STATIONARY normally
+            self._set_state(STATE_HELD, smoothed, center)
         elif self._settle_count >= self.settle_frames:
             self._set_state(STATE_STATIONARY, smoothed, center)
         else:
-            # 
             self._set_state(STATE_HELD, smoothed, center)
 
         color = STATE_COLORS[self._state]
@@ -476,6 +489,7 @@ class CylinderVelocityNode(Node):
         self._finish(out, center, smoothed, now)
         return out
 
+    # called at the end of every _process() pass,
     def _finish(self, out: np.ndarray, center, smoothed: float, now: float):
         """Sparkline, HUD text, and CSV row — shared by both detection paths."""
         self._spark_hist.append(smoothed)
@@ -549,6 +563,7 @@ def main():
     print(f"[INFO] Spike frames:   {args.spike_frames}")
     print(f"[INFO] Settle frames:  {args.settle_frames}")
     print(f"[INFO] Max jump:       {args.max_jump} px/s")
+    print(f"[INFO] Drop timeout:   {args.drop_timeout} s")
     if args.log:
         print(f"[INFO] CSV log:        {args.log}")
     print("[INFO] Press 'q' to quit.\n")
@@ -558,7 +573,8 @@ def main():
     node   = CylinderVelocityNode(
         args.topic, model, args.conf, args.imgsz,
         args.vel_stat, args.vel_drop, args.lost, args.vel_window,
-        args.spike_frames, args.settle_frames, args.max_jump, args.log)
+        args.spike_frames, args.settle_frames, args.max_jump,
+        args.drop_timeout, args.log)
 
     executor    = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
@@ -595,27 +611,21 @@ def main():
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--topic",      default=DEFAULT_TOPIC,   help="Compressed image topic")
-    p.add_argument("--weights",    default=DEFAULT_WEIGHTS, help="YOLO .pt weights")
-    p.add_argument("--conf",       type=float, default=0.45, help="Detection confidence threshold")
-    p.add_argument("--imgsz",      type=int,   default=320,  help="YOLO inference resolution")
-    p.add_argument("--vel-stat",   type=float, default=2.0,
-                   help="Stationary threshold px/frame")
-    p.add_argument("--vel-drop",   type=float, default=8.0,
-                   help="Drop threshold px/frame")
-    p.add_argument("--lost",       type=int,   default=5,
-                   help="Consecutive missed detections before tracking-loss -> DROPPED")
-    p.add_argument("--vel-window",    type=int,   default=8,
-                   help="Rolling average window for velocity smoothing")
-    p.add_argument("--spike-frames",  type=int,   default=2,
-                   help="Consecutive frames above vel-drop before DROPPED")
-    p.add_argument("--settle-frames", type=int,   default=3,
-                   help="Consecutive frames below vel-stat before STATIONARY")
-    p.add_argument("--log",  default=None, help="Optional path for CSV output")
-    p.add_argument("--max-jump",  type=float, default=800.0,
-                   help="Max implied speed (px/s) before a detection is rejected as spurious")
-    p.add_argument("--mode", default="velocity", choices=["velocity", "dist"],
-                   help="'velocity' shows time-series plot; 'dist' shows histogram of all samples")
+    p.add_argument("--topic",                     default=DEFAULT_TOPIC,    help="Compressed image topic")
+    p.add_argument("--weights",                   default=DEFAULT_WEIGHTS,  help="YOLO .pt weights")
+    p.add_argument("--conf",          type=float, default=0.45,             help="Detection confidence threshold")
+    p.add_argument("--imgsz",         type=int,   default=320,              help="YOLO inference resolution")
+    p.add_argument("--vel-stat",      type=float, default=2.0,              help="Stationary threshold px/frame")
+    p.add_argument("--vel-drop",      type=float, default=50.0,             help="Drop threshold px/frame")
+    p.add_argument("--lost",          type=int,   default=10,               help="Consecutive missed detections before tracking-loss -> DROPPED")
+    p.add_argument("--vel-window",    type=int,   default=5,                help="Rolling average window for velocity smoothing") # the higher, the more stable but the longer the lag
+    p.add_argument("--spike-frames",  type=int,   default=2,                help="Consecutive frames above vel-drop before DROPPED")
+    p.add_argument("--settle-frames", type=int,   default=5,                help="Consecutive frames below vel-stat before STATIONARY")
+    p.add_argument("--log",                       default=None,             help="Optional path for CSV output")
+    p.add_argument("--max-jump",      type=float, default=800.0,            help="Max implied speed (px/s) before a detection is rejected as spurious")
+    p.add_argument("--drop-timeout",  type=float, default=2.0,              help="Seconds before DROPPED auto-resets to STATIONARY if settle never triggers")
+    p.add_argument("--mode",                      default="velocity", 
+                                        choices=["velocity", "dist"],       help="'velocity' shows time-series plot; 'dist' shows histogram of all samples")
     return p.parse_args()
 
 
