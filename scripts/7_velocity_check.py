@@ -267,7 +267,7 @@ class CylinderVelocityNode(Node):
     def __init__(self, topic: str, model: YOLO, conf: float, imgsz: int,
                  vel_stat: float, vel_drop: float, lost_frames: int,
                  vel_window: int, spike_frames: int, settle_frames: int,
-                 max_jump: float, drop_timeout: float, log_path):
+                 max_jump: float, drop_timeout: float, log_path, settings: dict = None):
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', topic)
         safe = re.sub(r'_+', '_', safe).strip('_')
         super().__init__(f"cylinder_velocity_{safe}")
@@ -314,6 +314,13 @@ class CylinderVelocityNode(Node):
 
         self._log_file = open(log_path, "w") if log_path else None
         if self._log_file is not None:
+            if settings and settings.get("title"):
+                self._log_file.write(f"# title={settings['title']}\n")
+            self._log_file.write(f"# recorded {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            if settings:
+                for k, v in settings.items():
+                    if k != "title":
+                        self._log_file.write(f"# {k}={v}\n")
             self._log_file.write("timestamp_s,state,vel_px_s,cx,cy\n")
         self._start_time = time.time()
 
@@ -564,9 +571,29 @@ def main():
     print(f"[INFO] Settle frames:  {args.settle_frames}")
     print(f"[INFO] Max jump:       {args.max_jump} px/s")
     print(f"[INFO] Drop timeout:   {args.drop_timeout} s")
+    if args.log == "__auto__":
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        slug = args.title.replace(" ", "_") if args.title else "session"
+        args.log = f"{slug}_{ts}.csv"
     if args.log:
         print(f"[INFO] CSV log:        {args.log}")
     print("[INFO] Press 'q' to quit.\n")
+
+    settings = {
+        "title":         args.title,
+        "weights":       args.weights,
+        "topic":         args.topic,
+        "conf":          args.conf,
+        "imgsz":         args.imgsz,
+        "vel_stat":      args.vel_stat,
+        "vel_drop":      args.vel_drop,
+        "lost":          args.lost,
+        "vel_window":    args.vel_window,
+        "spike_frames":  args.spike_frames,
+        "settle_frames": args.settle_frames,
+        "max_jump":      args.max_jump,
+        "drop_timeout":  args.drop_timeout,
+    }
 
     window      = "Cylinder Velocity Check"
     plot_window = "Cylinder Velocity Plot" if args.mode == "velocity" else "Velocity Distribution"
@@ -574,7 +601,7 @@ def main():
         args.topic, model, args.conf, args.imgsz,
         args.vel_stat, args.vel_drop, args.lost, args.vel_window,
         args.spike_frames, args.settle_frames, args.max_jump,
-        args.drop_timeout, args.log)
+        args.drop_timeout, args.log, settings)
 
     executor    = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
@@ -615,13 +642,15 @@ def parse_args():
     p.add_argument("--weights",                   default=DEFAULT_WEIGHTS,  help="YOLO .pt weights")
     p.add_argument("--conf",          type=float, default=0.45,             help="Detection confidence threshold")
     p.add_argument("--imgsz",         type=int,   default=320,              help="YOLO inference resolution")
-    p.add_argument("--vel-stat",      type=float, default=2.0,              help="Stationary threshold px/frame")
+    p.add_argument("--vel-stat",      type=float, default=1.5,              help="Stationary threshold px/frame")
     p.add_argument("--vel-drop",      type=float, default=50.0,             help="Drop threshold px/frame")
     p.add_argument("--lost",          type=int,   default=10,               help="Consecutive missed detections before tracking-loss -> DROPPED")
     p.add_argument("--vel-window",    type=int,   default=5,                help="Rolling average window for velocity smoothing") # the higher, the more stable but the longer the lag
     p.add_argument("--spike-frames",  type=int,   default=2,                help="Consecutive frames above vel-drop before DROPPED")
     p.add_argument("--settle-frames", type=int,   default=5,                help="Consecutive frames below vel-stat before STATIONARY")
-    p.add_argument("--log",                       default=None,             help="Optional path for CSV output")
+    p.add_argument("--log",           nargs="?",  default=None, const="__auto__",
+                   help="CSV output path; omit value to auto-generate from title + timestamp")
+    p.add_argument("--title",                     default=None,             help="Optional session title written as first comment in the CSV")
     p.add_argument("--max-jump",      type=float, default=800.0,            help="Max implied speed (px/s) before a detection is rejected as spurious")
     p.add_argument("--drop-timeout",  type=float, default=2.0,              help="Seconds before DROPPED auto-resets to STATIONARY if settle never triggers")
     p.add_argument("--mode",                      default="velocity", 
