@@ -34,6 +34,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSPresetProfiles
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import PoseStamped
 
 from ultralytics import YOLO
 
@@ -312,6 +313,10 @@ class CylinderVelocityNode(Node):
         self._dist_lock          = threading.Lock()
         self._last_dist_update   = 0.0  # throttle histogram redraws
 
+        # PSM1 kinematic state (updated by ROS callback)
+        self._psm1_lock = threading.Lock()
+        self._psm1_pose = None  # latest geometry_msgs/PoseStamped
+
         self._log_file = open(log_path, "w") if log_path else None
         if self._log_file is not None:
             if settings and settings.get("title"):
@@ -321,16 +326,24 @@ class CylinderVelocityNode(Node):
                 for k, v in settings.items():
                     if k != "title":
                         self._log_file.write(f"# {k}={v}\n")
-            self._log_file.write("timestamp_s,state,vel_px_s,cx,cy\n")
+            self._log_file.write(
+                "timestamp_s,state,vel_px_s,cx,cy,"
+                "psm1_x,psm1_y,psm1_z,psm1_qx,psm1_qy,psm1_qz,psm1_qw\n")
         self._start_time = time.time()
 
         qos = QoSPresetProfiles.SENSOR_DATA.value
         self.sub = self.create_subscription(CompressedImage, topic, self._cb, qos)
+        self.sub_psm1 = self.create_subscription(
+            PoseStamped, "/PSM1/measured_cp", self._psm1_cb, qos)
         self.get_logger().info(f"Subscribed to {topic}")
 
         self._stop        = threading.Event()
         self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         self._infer_thread.start()
+
+    def _psm1_cb(self, msg: PoseStamped):
+        with self._psm1_lock:
+            self._psm1_pose = msg
 
     # called whenever a new camera frame arrives (~30 fps)
     def _cb(self, msg: CompressedImage):
@@ -522,9 +535,21 @@ class CylinderVelocityNode(Node):
         if self._log_file is not None:
             cx = int(center[0]) if center is not None else -1
             cy = int(center[1]) if center is not None else -1
+            with self._psm1_lock:
+                pose = self._psm1_pose
+            if pose is not None:
+                p = pose.pose.position
+                q = pose.pose.orientation
+                psm1_str = f"{p.x:.6f},{p.y:.6f},{p.z:.6f},{q.x:.6f},{q.y:.6f},{q.z:.6f},{q.w:.6f}"
+            else:
+                psm1_str = ",,,,,,,"
             self._log_file.write(
                 f"{now - self._start_time:.3f},{self._state},"
-                f"{smoothed:.3f},{cx},{cy}\n")
+                f"{smoothed:.3f},{cx},{cy},{psm1_str}\n")
+
+    def get_annotated_frame(self):
+        with self._ann_lock:
+            return self._annotated_frame
 
     def show(self, window_name: str):
         with self._ann_lock:
@@ -577,6 +602,12 @@ def main():
         args.log = f"{slug}_{ts}.csv"
     if args.log:
         print(f"[INFO] CSV log:        {args.log}")
+    if args.record == "__auto__":
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        slug = args.title.replace(" ", "_") if args.title else "session"
+        args.record = f"{slug}_{ts}.mp4"
+    if args.record:
+        print(f"[INFO] Video record:   {args.record}")
     print("[INFO] Press 'q' to quit.\n")
 
     settings = {
@@ -615,9 +646,20 @@ def main():
     cv2.namedWindow(plot_window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(plot_window, pw, ph)
 
+    video_writer = None
+
     try:
         while rclpy.ok():
-            node.show(window)
+            frame = node.get_annotated_frame()
+            if frame is not None:
+                cv2.imshow(window, frame)
+                if args.record:
+                    if video_writer is None:
+                        h, w = frame.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        video_writer = cv2.VideoWriter(args.record, fourcc, 30.0, (w, h))
+                        print(f"[INFO] Recording started → {args.record}")
+                    video_writer.write(frame)
             if args.mode == "dist":
                 node.show_dist_plot(plot_window)
             else:
@@ -628,6 +670,9 @@ def main():
         pass
     finally:
         node.stop()
+        if video_writer is not None:
+            video_writer.release()
+            print(f"[INFO] Video saved → {args.record}")
         cv2.destroyAllWindows()
         executor.shutdown()
         try:
@@ -650,6 +695,8 @@ def parse_args():
     p.add_argument("--settle-frames", type=int,   default=5,                help="Consecutive frames below vel-stat before STATIONARY")
     p.add_argument("--log",           nargs="?",  default=None, const="__auto__",
                    help="CSV output path; omit value to auto-generate from title + timestamp")
+    p.add_argument("--record",        nargs="?",  default=None, const="__auto__",
+                   help="MP4 output path; omit value to auto-generate from title + timestamp")
     p.add_argument("--title",                     default=None,             help="Optional session title written as first comment in the CSV")
     p.add_argument("--max-jump",      type=float, default=800.0,            help="Max implied speed (px/s) before a detection is rejected as spurious")
     p.add_argument("--drop-timeout",  type=float, default=2.0,              help="Seconds before DROPPED auto-resets to STATIONARY if settle never triggers")
