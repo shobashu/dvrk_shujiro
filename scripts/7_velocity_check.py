@@ -687,7 +687,7 @@ def parse_args():
     p.add_argument("--weights",                   default=DEFAULT_WEIGHTS,  help="YOLO .pt weights")
     p.add_argument("--conf",          type=float, default=0.45,             help="Detection confidence threshold")
     p.add_argument("--imgsz",         type=int,   default=320,              help="YOLO inference resolution")
-    p.add_argument("--vel-stat",      type=float, default=1.5,              help="Stationary threshold px/frame")
+    p.add_argument("--vel-stat",      type=float, default=2,              help="Stationary threshold px/frame")
     p.add_argument("--vel-drop",      type=float, default=50.0,             help="Drop threshold px/frame")
     p.add_argument("--lost",          type=int,   default=10,               help="Consecutive missed detections before tracking-loss -> DROPPED")
     p.add_argument("--vel-window",    type=int,   default=5,                help="Rolling average window for velocity smoothing") # the higher, the more stable but the longer the lag

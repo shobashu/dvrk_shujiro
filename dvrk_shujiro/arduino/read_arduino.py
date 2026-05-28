@@ -1,3 +1,5 @@
+import queue as _queue
+import select
 import serial
 import time
 import csv
@@ -7,6 +9,38 @@ import sys
 ARDUINO_PORT = '/dev/ttyACM0'  # Change this to your actual port (e.g., '/dev/ttyACM0' on Mac/Linux)
 BAUD_RATE = 9600
 CSV_FILENAME = 'experiment_data.csv'
+
+
+def arduino_loop(lifted_queue: _queue.Queue, stop_event):
+    """Read Arduino serial output and push relevant messages onto lifted_queue.
+    Also forwards terminal stdin input to the Arduino (e.g. 's' to start, 'q' to abort)."""
+    try:
+        arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
+        time.sleep(2)
+        print("[ARDUINO] Connected. Type 's' + Enter to start, 'q' + Enter to abort.")
+        while not stop_event.is_set():
+            # Forward terminal input to Arduino
+            ready, _, _ = select.select([sys.stdin], [], [], 0.0001)
+            if ready:
+                cmd = sys.stdin.readline().strip()
+                if cmd:
+                    arduino.write(cmd.encode('utf-8'))
+
+            # Read from Arduino
+            if arduino.in_waiting > 0:
+                line = arduino.readline().decode('utf-8', errors='replace').strip()
+                if not line:
+                    continue
+                if "Object lifted. Move to Outer Peg" in line or "Target hit" in line:
+                    lifted_queue.put(line)
+                else:
+                    print(f"[ARDUINO] {line}")
+    except serial.SerialException as e:
+        print(f"[ARDUINO] Error connecting to {ARDUINO_PORT}: {e}")
+    finally:
+        if 'arduino' in locals() and arduino.is_open:
+            arduino.close()
+
 
 def main():
     try:
