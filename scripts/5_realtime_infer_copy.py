@@ -589,7 +589,7 @@ def batch_infer_loop(left_node: 'YOLOCameraNode', right_node: 'YOLOCameraNode',
 
                 imgsz=left_node.imgsz,
 
-                classes=left_node.classes,
+                classes=[0],
 
                 verbose=False,
 

@@ -145,3 +145,8 @@ Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
 1,4,Blue,1778787435.273,1778787452.033,1778787453.953
 2,6,Blue,1778787458.613,1778787461.683,1778787464.313
 Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
+Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
+Trial,Target_Peg,Target_Color,Unix_Cue_Time,Unix_Lift_Time,Unix_Place_Time
+1,6,Blue,1780435836.199,1780435850.029,1780435851.429
+2,3,Blue,1780435862.599,1780435866.259,1780435868.939
+3,5,Blue,1780435884.969,1780435891.539,1780435893.979
