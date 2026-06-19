@@ -1,27 +1,38 @@
 """
-Three-phase workflow for peg registration + 3-D evaluation + cylinder tracking.
+Three-phase workflow: level calibration → peg registration → cylinder tracking.
 
-Phase 1 — REGISTER
-  Click on the top of each side peg to lock its 3D position.
-  The positions are saved as static reference markers.
+Phase 1a — CALIBRATE
+  Click 3 points you know are at the same real height (e.g. three corners of
+  the task board, or any three same-level landmarks).  The script fits a plane
+  through those points and uses its normal as the true "up" axis, correcting
+  for any camera tilt or roll.
+  Skip with --skip-cal to use raw camera Y as the height axis.
 
-Phase 2 — MAP
-  A 3-D matplotlib window shows the registered peg positions so you can
-  evaluate the registration before starting tracking.
+Phase 1b — REGISTER
+  Click the top of each peg to record its 3D position.
+
+Phase 2 — MAP  (optional, skip with --skip-map)
+  Blocking 3-D matplotlib window to review peg positions before tracking.
 
 Phase 3 — TRACK
-  YOLO runs on every frame.  The cylinder's live 3D position is shown
-  together with the registered peg markers.
+  YOLO detects the cylinder every frame; live 3D position is shown.
+
+Controls  (CALIBRATE phase):
+  Left-click   record a same-height reference point (need exactly 3)
+  u            undo the last calibration point
+  s            skip calibration, use default Y axis
+  q            quit
 
 Controls  (REGISTER phase):
   Left-click   record a peg top
   u            undo the last peg
-  Enter        finish registration → open 3-D map
+  Enter        open 3-D map (or go to tracking if --skip-map)
   q            quit
 
-Controls  (MAP phase):
-  Enter        close map → start tracking
-  q            quit
+Controls  (MAP window — click the matplotlib window first):
+  Enter / T    start tracking
+  R            back to registration
+  Q            quit
 
 Controls  (TRACK phase):
   q            quit
@@ -31,11 +42,12 @@ Coordinate frame  (origin = camera optical centre):
 
 Usage:
   python register_and_track.py
+  python register_and_track.py --skip-cal           # skip tilt calibration
+  python register_and_track.py --skip-map           # skip 3-D map review
   python register_and_track.py --weights best.pt --conf 0.5 --imgsz 320
 """
 
 import argparse
-import threading
 from pathlib import Path
 
 import matplotlib
@@ -48,7 +60,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from ultralytics import YOLO
 
 # ── constants ─────────────────────────────────────────────────────────────────
-DEFAULT_WEIGHTS = "models/best_v2.pt"
+DEFAULT_WEIGHTS     = "models/best_v2.pt"
 DEPTH_SAMPLE_RADIUS = 5
 
 CLASS_NAMES = {
@@ -64,21 +76,30 @@ CLASS_COLORS = {
     3: (255, 255,   0),
 }
 
-# Distinct colours cycled across registered pegs
 PEG_PALETTE = [
-    (0,   255, 128),   # green
-    (255, 128,   0),   # orange
-    (0,   180, 255),   # sky blue
-    (220,   0, 255),   # magenta
-    (0,   255, 255),   # cyan
-    (255, 220,   0),   # gold
-    (180,   0, 255),   # purple
-    (0,   220, 180),   # teal
+    (0,   255, 128),
+    (255, 128,   0),
+    (0,   180, 255),
+    (220,   0, 255),
+    (0,   255, 255),
+    (255, 220,   0),
+    (180,   0, 255),
+    (0,   220, 180),
 ]
 
-PHASE_REGISTER = "register"
-PHASE_MAP      = "map"
-PHASE_TRACK    = "track"
+PHASE_CALIBRATE = "calibrate"
+PHASE_REGISTER  = "register"
+PHASE_TRACK     = "track"
+
+# ── shared state ──────────────────────────────────────────────────────────────
+state = {
+    "phase":      PHASE_CALIBRATE,
+    "calib_pts":  [],          # up to 2 same-height reference points
+    "up_axis":    np.array([0., -1., 0.]),  # default: camera -Y = up (level camera)
+    "pegs":       [],
+    "depth_frame": None,
+    "intrinsics":  None,
+}
 
 
 # ── depth helper ──────────────────────────────────────────────────────────────
@@ -95,102 +116,189 @@ def get_median_depth(depth_frame, u, v, radius=DEPTH_SAMPLE_RADIUS):
     return float(np.median(depths)) if depths else 0.0
 
 
-# ── shared state ──────────────────────────────────────────────────────────────
-state = {
-    "phase":       PHASE_REGISTER,
-    "pegs":        [],     # [{"pixel":(u,v), "xyz":(X,Y,Z), "color":(r,g,b), "label":"Peg 1"}, …]
-    "depth_frame": None,
-    "intrinsics":  None,
-}
-
-
-# ── mouse callback (REGISTER phase only) ─────────────────────────────────────
-def on_mouse(event, x, y, flags, param):
-    if event != cv2.EVENT_LBUTTONDOWN:
-        return
-    if state["phase"] != PHASE_REGISTER:
-        return
-
+def get_xyz(x, y):
+    """Deproject pixel (x,y) to 3D using current depth frame. Returns xyz or None."""
     depth_frame = state["depth_frame"]
     intrinsics  = state["intrinsics"]
     if depth_frame is None or intrinsics is None:
-        return
-
+        return None
     depth_m = get_median_depth(depth_frame, x, y)
     if depth_m <= 0:
         raw = depth_frame.get_distance(x, y)
         print(f"  [!] No valid depth at ({x},{y}) — raw={raw:.3f} m  (too close / reflective?)")
+        return None
+    return tuple(rs.rs2_deproject_pixel_to_point(intrinsics, [float(x), float(y)], depth_m))
+
+
+# ── height helper ─────────────────────────────────────────────────────────────
+def height_diff(xyz_from, xyz_to):
+    """Signed height difference using the calibrated up axis.
+    Positive = xyz_to is higher than xyz_from in real world."""
+    d = np.array(xyz_to) - np.array(xyz_from)
+    return float(np.dot(d, state["up_axis"]))
+
+
+def compute_up_axis(pt_a, pt_b, pt_c):
+    """Derive world-up in camera space from three co-planar same-height 3D points.
+    Fits a plane and returns its normal (no roll assumption needed)."""
+    v1 = np.array(pt_b) - np.array(pt_a)
+    v2 = np.array(pt_c) - np.array(pt_a)
+    up = np.cross(v1, v2)
+    norm = np.linalg.norm(up)
+    if norm < 1e-6:
+        print("  [!] Calibration points collinear — keeping default axis.")
+        return state["up_axis"].copy()
+    up /= norm
+    # Ensure it points "up" (negative camera-Y when roughly level)
+    if up[1] > 0:
+        up = -up
+    return up
+
+
+# ── mouse callback ────────────────────────────────────────────────────────────
+def on_mouse(event, x, y, flags, param):
+    if event != cv2.EVENT_LBUTTONDOWN:
         return
 
-    xyz   = tuple(rs.rs2_deproject_pixel_to_point(intrinsics, [float(x), float(y)], depth_m))
-    n     = len(state["pegs"]) + 1
-    color = PEG_PALETTE[(n - 1) % len(PEG_PALETTE)]
-    label = f"Peg {n}"
+    if state["phase"] == PHASE_CALIBRATE:
+        if len(state["calib_pts"]) >= 3:
+            return
+        xyz = get_xyz(x, y)
+        if xyz is None:
+            return
+        state["calib_pts"].append({"pixel": (x, y), "xyz": xyz})
+        n = len(state["calib_pts"])
+        X, Y, Z = xyz
+        print(f"  Cal point {n}/3: X={X:+.4f}  Y={Y:+.4f}  Z={Z:.4f} m")
 
-    state["pegs"].append({"pixel": (x, y), "xyz": xyz, "color": color, "label": label})
+        if n == 3:
+            up = compute_up_axis(state["calib_pts"][0]["xyz"],
+                                 state["calib_pts"][1]["xyz"],
+                                 state["calib_pts"][2]["xyz"])
+            state["up_axis"] = up
+            print(f"  Calibrated up axis (camera frame): "
+                  f"[{up[0]:+.3f}, {up[1]:+.3f}, {up[2]:+.3f}]")
+            print("  Calibration done — advancing to peg registration.\n")
+            print("--- PHASE 1b: REGISTER ---")
+            print("Left-click peg tops. 'u' = undo. Enter = open map / start tracking.\n")
+            state["phase"] = PHASE_REGISTER
 
-    X, Y, Z = xyz
-    print(f"  Registered {label}  X={X:+.4f}  Y={Y:+.4f}  Z={Z:.4f} m")
+    elif state["phase"] == PHASE_REGISTER:
+        xyz = get_xyz(x, y)
+        if xyz is None:
+            return
+        n     = len(state["pegs"]) + 1
+        color = PEG_PALETTE[(n - 1) % len(PEG_PALETTE)]
+        label = f"Peg {n}"
+        state["pegs"].append({"pixel": (x, y), "xyz": xyz, "color": color, "label": label})
 
-    if len(state["pegs"]) > 1:
-        print("  Height differences (Y) vs previous pegs:")
-        for prev in state["pegs"][:-1]:
-            dy = Y - prev["xyz"][1]
-            print(f"    {label} vs {prev['label']}:  ΔY={dy:+.4f} m  ({dy*1000:+.1f} mm)")
+        X, Y, Z = xyz
+        print(f"  Registered {label}  X={X:+.4f}  Y={Y:+.4f}  Z={Z:.4f} m")
+
+        if len(state["pegs"]) > 1:
+            print("  Height differences vs previous pegs:")
+            for prev in state["pegs"][:-1]:
+                dh = height_diff(prev["xyz"], xyz)
+                print(f"    {label} vs {prev['label']}:  Δh={dh:+.4f} m  ({dh*1000:+.1f} mm)")
 
 
 # ── overlay helpers ───────────────────────────────────────────────────────────
+def draw_dot_marker(frame, pixel, color, label):
+    u, v = pixel
+    cv2.drawMarker(frame, (u, v), color, cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA)
+    cv2.circle(frame, (u, v), 7, color, 1, cv2.LINE_AA)
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    tx = max(0, min(u - tw // 2, frame.shape[1] - tw - 4))
+    ty = v - 16
+    if ty < th + 4:
+        ty = v + 26
+    cv2.rectangle(frame, (tx - 2, ty - th - 3), (tx + tw + 2, ty + 2), (0, 0, 0), -1)
+    cv2.putText(frame, label, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+
 def draw_peg_markers(frame):
-    """Draw a crosshair + label for every registered peg."""
     for peg in state["pegs"]:
-        u, v   = peg["pixel"]
-        color  = peg["color"]
-        label  = peg["label"]
+        draw_dot_marker(frame, peg["pixel"], peg["color"], peg["label"])
 
-        cv2.drawMarker(frame, (u, v), color, cv2.MARKER_CROSS, 22, 2, cv2.LINE_AA)
-        cv2.circle(frame, (u, v), 7, color, 1, cv2.LINE_AA)
 
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-        tx = max(0, min(u - tw // 2, frame.shape[1] - tw - 4))
-        ty = v - 16
-        if ty < th + 4:
-            ty = v + 26
-        cv2.rectangle(frame, (tx - 2, ty - th - 3), (tx + tw + 2, ty + 2), (0, 0, 0), -1)
-        cv2.putText(frame, label, (tx, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+def draw_calib_markers(frame):
+    for i, pt in enumerate(state["calib_pts"]):
+        draw_dot_marker(frame, pt["pixel"], (0, 255, 200), f"Ref {i+1}")
+
+
+def draw_axes_legend(frame):
+    h, w = frame.shape[:2]
+    ox, oy = 50, h - 65
+    L = 35
+
+    # Background box — taller when calibration info is shown
+    cal_active = not np.allclose(state["up_axis"], [0., -1., 0.])
+    box_h = 18 if not cal_active else 30
+    cv2.rectangle(frame, (ox - 15, oy - L - 10), (ox + L + 55, oy + L + box_h),
+                  (20, 20, 20), -1)
+    cv2.rectangle(frame, (ox - 15, oy - L - 10), (ox + L + 55, oy + L + box_h),
+                  (80, 80, 80), 1)
+
+    # X → right (red)
+    cv2.arrowedLine(frame, (ox, oy), (ox + L, oy), (0, 0, 220), 2,
+                    tipLength=0.3, line_type=cv2.LINE_AA)
+    cv2.putText(frame, "X", (ox + L + 4, oy + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 220), 1, cv2.LINE_AA)
+
+    # Y → down (green)
+    cv2.arrowedLine(frame, (ox, oy), (ox, oy + L), (0, 200, 0), 2,
+                    tipLength=0.3, line_type=cv2.LINE_AA)
+    cv2.putText(frame, "Y", (ox - 14, oy + L + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1, cv2.LINE_AA)
+
+    # Z → forward (blue dot)
+    cv2.circle(frame, (ox, oy), 7, (220, 100, 0), 1, cv2.LINE_AA)
+    cv2.circle(frame, (ox, oy), 3, (220, 100, 0), -1, cv2.LINE_AA)
+    cv2.putText(frame, "Z", (ox - 14, oy - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 100, 0), 1, cv2.LINE_AA)
+
+    cv2.putText(frame, "origin = camera centre", (ox - 13, oy + L + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (150, 150, 150), 1, cv2.LINE_AA)
+
+    if cal_active:
+        u = state["up_axis"]
+        cv2.putText(frame,
+                    f"up=[{u[0]:+.2f},{u[1]:+.2f},{u[2]:+.2f}]",
+                    (ox - 13, oy + L + 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0, 220, 180), 1, cv2.LINE_AA)
+
+
+def draw_calibrate_hud(frame):
+    n = len(state["calib_pts"])
+    w = frame.shape[1]
+    cv2.rectangle(frame, (0, 0), (w, 30), (40, 20, 20), -1)
+    cv2.putText(frame,
+                f"LEVEL CAL  |  {n}/3 ref points  |  "
+                "left-click 3 same-height pts  |  u = undo  |  s = skip  |  q = quit",
+                (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    draw_axes_legend(frame)
+    draw_calib_markers(frame)
 
 
 def draw_register_hud(frame):
     n = len(state["pegs"])
     w = frame.shape[1]
-
     cv2.rectangle(frame, (0, 0), (w, 30), (30, 30, 30), -1)
     cv2.putText(frame,
-                f"REGISTER  |  {n} peg(s) recorded  |  "
-                "left-click = add  |  u = undo  |  Enter = start tracking  |  q = quit",
+                f"REGISTER  |  {n} peg(s)  |  "
+                "left-click = add  |  u = undo  |  Enter = map/track  |  q = quit",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
-
-    draw_peg_markers(frame)
-
-
-def draw_map_hud(frame):
-    w = frame.shape[1]
-    cv2.rectangle(frame, (0, 0), (w, 30), (20, 40, 20), -1)
-    cv2.putText(frame,
-                f"MAP  |  {len(state['pegs'])} peg(s) registered  |  "
-                "Enter = start tracking  |  q = quit",
-                (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    draw_axes_legend(frame)
     draw_peg_markers(frame)
 
 
 def draw_track_hud(frame, detections):
     w = frame.shape[1]
-
     cv2.rectangle(frame, (0, 0), (w, 30), (20, 20, 40), -1)
     cv2.putText(frame, "TRACKING  |  q = quit",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
 
-    # YOLO detection overlays
     for det in detections:
         cls_id = det["cls_id"]
         x1, y1, x2, y2 = det["bbox"]
@@ -216,51 +324,38 @@ def draw_track_hud(frame, detections):
         cv2.putText(frame, pos_str, (x1, y2 + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
-    # Peg reference markers (static)
     draw_peg_markers(frame)
 
 
-# ── detection helper (TRACK phase) ───────────────────────────────────────────
+# ── detection helper ──────────────────────────────────────────────────────────
 def run_detections(model, color_img, depth_frame, intrinsics, conf, imgsz, classes):
-    results = model.predict(
-        color_img,
-        conf=conf,
-        imgsz=imgsz,
-        classes=classes,
-        verbose=False,
-    )[0]
-
+    results = model.predict(color_img, conf=conf, imgsz=imgsz,
+                            classes=classes, verbose=False)[0]
     detections = []
     if results.boxes is None:
         return detections
-
     for box in results.boxes:
         cls_id      = int(box.cls[0])
         confidence  = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cx, cy      = (x1 + x2) // 2, (y1 + y2) // 2
         depth_m     = get_median_depth(depth_frame, cx, cy)
-
         xyz = None
         if depth_m > 0:
             xyz = tuple(rs.rs2_deproject_pixel_to_point(
-                intrinsics, [float(cx), float(cy)], depth_m
-            ))
-
+                intrinsics, [float(cx), float(cy)], depth_m))
         detections.append({
-            "cls_id": cls_id,
-            "conf":   confidence,
-            "bbox":   (x1, y1, x2, y2),
-            "center": (cx, cy),
-            "xyz":    xyz,
+            "cls_id": cls_id, "conf": confidence,
+            "bbox": (x1, y1, x2, y2), "center": (cx, cy), "xyz": xyz,
         })
-
     return detections
 
 
 # ── 3-D map ───────────────────────────────────────────────────────────────────
-def _plot_3d(pegs):
-    """Runs in a background thread so OpenCV and matplotlib event loops are independent."""
+def show_3d_map_blocking(pegs):
+    """Blocking 3-D map in main thread. Returns 'track', 'register', or 'quit'."""
+    result = {"action": "track"}
+
     fig = plt.figure(figsize=(8, 6))
     ax  = fig.add_subplot(111, projection="3d")
 
@@ -273,41 +368,73 @@ def _plot_3d(pegs):
     for p in pegs:
         ax.text(p["xyz"][0], p["xyz"][1], p["xyz"][2], f"  {p['label']}", fontsize=8)
 
-    # cyan plane at mean Y to show the ideal level
-    mean_y = float(np.mean(ys))
-    xx, zz = np.meshgrid(
-        [min(xs) - 0.02, max(xs) + 0.02],
-        [min(zs) - 0.02, max(zs) + 0.02],
-    )
-    ax.plot_surface(xx, np.full_like(xx, mean_y), zz, alpha=0.15, color="cyan")
+    # Reference plane perpendicular to the calibrated up axis at the mean peg height
+    up  = state["up_axis"]
+    pts = np.array([p["xyz"] for p in pegs])
+    mean_h  = float(np.dot(pts, up).mean())   # mean height along up axis
+    mean_pt = mean_h * up                     # point on the plane (closest to origin)
+
+    # Build two tangent vectors in the plane
+    ref = np.array([1., 0., 0.]) if abs(up[0]) < 0.9 else np.array([0., 1., 0.])
+    t1  = np.cross(up, ref);  t1 /= np.linalg.norm(t1)
+    t2  = np.cross(up, t1);   t2 /= np.linalg.norm(t2)
+    span = 0.06
+    corners = [mean_pt + a*t1 + b*t2
+               for a in (-span, span) for b in (-span, span)]
+    px = np.array([[corners[0][0], corners[1][0]],
+                   [corners[2][0], corners[3][0]]])
+    py = np.array([[corners[0][1], corners[1][1]],
+                   [corners[2][1], corners[3][1]]])
+    pz = np.array([[corners[0][2], corners[1][2]],
+                   [corners[2][2], corners[3][2]]])
+    ax.plot_surface(px, py, pz, alpha=0.20, color="cyan")
 
     ax.set_xlabel("X  (right, m)")
     ax.set_ylabel("Y  (down, m)")
     ax.set_zlabel("Z  (depth, m)")
-    ax.set_title("Registered peg positions\n(cyan plane = mean height)\n"
-                 "drag to rotate  |  scroll to zoom")
+    cal_note = ("calibrated tilt correction"
+                if not np.allclose(up, [0., -1., 0.]) else "default Y axis")
+    ax.set_title(
+        f"Registered peg positions  ({len(pegs)} pegs)\n"
+        f"Cyan plane = mean height level  [{cal_note}]\n"
+        "Enter / T = start tracking   |   R = re-register   |   Q = quit",
+        fontsize=9,
+    )
     ax.invert_yaxis()
 
+    def on_key(event):
+        k = (event.key or "").lower()
+        if k in ("enter", "t"):
+            result["action"] = "track"
+            plt.close(fig)
+        elif k == "r":
+            result["action"] = "register"
+            plt.close(fig)
+        elif k == "q":
+            result["action"] = "quit"
+            plt.close(fig)
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
     plt.tight_layout()
-    plt.show(block=True)   # blocks only this thread, not OpenCV
-
-
-def show_3d_map(pegs):
-    if not pegs:
-        return
-    t = threading.Thread(target=_plot_3d, args=(list(pegs),), daemon=True)
-    t.start()
+    plt.show(block=True)
+    return result["action"]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--weights", default=DEFAULT_WEIGHTS)
-    p.add_argument("--conf",    type=float, default=0.6)
-    p.add_argument("--imgsz",   type=int,   default=320)
-    p.add_argument("--classes", type=int,   nargs="+", default=None,
-                   help="Limit detection to these class IDs (default: all). "
+    p.add_argument("--weights",  default=DEFAULT_WEIGHTS)
+    p.add_argument("--conf",     type=float, default=0.6)
+    p.add_argument("--imgsz",    type=int,   default=320)
+    p.add_argument("--classes",  type=int,   nargs="+", default=None,
+                   help="Class IDs to detect (default: all). "
                         "0=cylinder 1=peg_inactive 2=peg_lit_blue 3=peg_lit_white")
+    p.add_argument("--skip-cal", action="store_true",
+                   help="Skip level calibration; use raw camera Y as height axis.")
+    p.add_argument("--skip-map", action="store_true",
+                   help="Skip Phase 2 (3-D map review).")
+    p.add_argument("--width",    type=int, default=640)
+    p.add_argument("--height",   type=int, default=480)
     args = p.parse_args()
 
     weights = Path(args.weights)
@@ -320,15 +447,14 @@ def main():
     print(f"Confidence: {args.conf}  |  Inference size: {args.imgsz}  |  "
           f"Classes: {args.classes if args.classes else 'all'}")
 
-    # RealSense
     pipeline = rs.pipeline()
     config   = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16,  30)
+    sw, sh = args.width, args.height
+    config.enable_stream(rs.stream.color, sw, sh, rs.format.bgr8, 30)
+    config.enable_stream(rs.stream.depth, sw, sh, rs.format.z16,  30)
 
     print("Starting RealSense streams…")
     profile = pipeline.start(config)
-
     state["intrinsics"] = (
         profile.get_stream(rs.stream.color)
                .as_video_stream_profile()
@@ -341,14 +467,19 @@ def main():
 
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
     cv2.namedWindow("Depth",  cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Camera", 640, 480)
-    cv2.resizeWindow("Depth",  640, 480)
+    cv2.resizeWindow("Camera", sw, sh)
+    cv2.resizeWindow("Depth",  sw, sh)
     cv2.setMouseCallback("Camera", on_mouse)
 
-    print("\n--- PHASE 1: REGISTER ---")
-    print("Left-click the top of each side peg to record its 3D position.")
-    print("Press 'u' to undo the last peg.")
-    print("Press Enter when done to start tracking.\n")
+    if args.skip_cal:
+        state["phase"] = PHASE_REGISTER
+        print("\n--- PHASE 1: REGISTER (calibration skipped — using camera Y axis) ---")
+        print("Left-click peg tops. 'u' = undo. Enter when done.\n")
+    else:
+        print("\n--- PHASE 1a: LEVEL CALIBRATION ---")
+        print("Left-click 3 points you know are at the SAME real height")
+        print("(e.g. three corners of the task board at the same level).")
+        print("'u' = undo last point  |  's' = skip calibration\n")
 
     try:
         while True:
@@ -364,11 +495,28 @@ def main():
 
             color_img = np.asanyarray(color_frame.get_data())
             depth_vis = np.asanyarray(colorizer.colorize(depth_frame).get_data())
+            frame     = color_img.copy()
 
-            # ── render ────────────────────────────────────────────────────────
-            frame = color_img.copy()
+            # ── CALIBRATE ─────────────────────────────────────────────────────
+            if state["phase"] == PHASE_CALIBRATE:
+                draw_calibrate_hud(frame)
+                cv2.imshow("Camera", frame)
+                cv2.imshow("Depth",  depth_vis)
 
-            if state["phase"] == PHASE_REGISTER:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("u") and state["calib_pts"]:
+                    state["calib_pts"].pop()
+                    print("  Removed last calibration point.")
+                elif key == ord("s"):
+                    print("  Calibration skipped — using default camera Y axis.\n")
+                    print("--- PHASE 1b: REGISTER ---")
+                    print("Left-click peg tops. 'u' = undo. Enter when done.\n")
+                    state["phase"] = PHASE_REGISTER
+
+            # ── REGISTER ──────────────────────────────────────────────────────
+            elif state["phase"] == PHASE_REGISTER:
                 draw_register_hud(frame)
                 cv2.imshow("Camera", frame)
                 cv2.imshow("Depth",  depth_vis)
@@ -382,33 +530,31 @@ def main():
                 elif key in (13, 10):  # Enter
                     if not state["pegs"]:
                         print("  [!] No pegs registered yet — click at least one.")
+                    elif args.skip_map:
+                        state["phase"] = PHASE_TRACK
+                        print(f"\n--- PHASE 3: TRACK ---")
+                        print(f"Tracking with {len(state['pegs'])} peg reference(s). q = quit.\n")
                     else:
-                        state["phase"] = PHASE_MAP
-                        show_3d_map(state["pegs"])
-                        print(f"\n--- PHASE 2: MAP ---")
-                        print(f"3-D map open. Press Enter to start tracking or q to quit.\n")
+                        print(f"\n--- PHASE 2: MAP ({len(state['pegs'])} peg(s)) ---")
+                        print("  Click on the matplotlib window, then use keyboard:\n"
+                              "  Enter/T = track  |  R = re-register  |  Q = quit\n")
+                        action = show_3d_map_blocking(state["pegs"])
+                        if action == "register":
+                            print("\n--- PHASE 1b: REGISTER (back) ---")
+                            print("Pegs kept. Add/undo with left-click / u. Enter when done.\n")
+                        elif action == "track":
+                            state["phase"] = PHASE_TRACK
+                            print(f"\n--- PHASE 3: TRACK ---")
+                            print(f"Tracking with {len(state['pegs'])} peg reference(s). q = quit.\n")
+                        else:
+                            break
 
-            elif state["phase"] == PHASE_MAP:
-                draw_map_hud(frame)
-                cv2.imshow("Camera", frame)
-                cv2.imshow("Depth",  depth_vis)
-
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                elif key in (13, 10):  # Enter
-                    plt.close("all")
-                    state["phase"] = PHASE_TRACK
-                    print(f"\n--- PHASE 3: TRACK ---")
-                    print(f"Tracking cylinder with {len(state['pegs'])} peg reference(s).")
-                    print("Press 'q' to quit.\n")
-
-            else:  # PHASE_TRACK
+            # ── TRACK ─────────────────────────────────────────────────────────
+            else:
                 detections = run_detections(
                     model, color_img, depth_frame, state["intrinsics"],
                     args.conf, args.imgsz, args.classes
                 )
-
                 draw_track_hud(frame, detections)
                 cv2.imshow("Camera", frame)
                 cv2.imshow("Depth",  depth_vis)
