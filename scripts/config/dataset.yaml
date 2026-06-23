@@ -1,4 +1,4 @@
-path: /home/cfxuser/dvrk_shujiro/scripts/data/dataset_v2
+path: /home/cfxuser/dvrk_shujiro/scripts/data/dataset_v3
 train: images/train
 val:   images/val
 test:  images/test
