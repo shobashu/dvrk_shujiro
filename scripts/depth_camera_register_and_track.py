@@ -62,6 +62,8 @@ from ultralytics import YOLO
 # ── constants ─────────────────────────────────────────────────────────────────
 DEFAULT_WEIGHTS     = "models/best_v2.pt"
 DEPTH_SAMPLE_RADIUS = 5
+CYLINDER_CLASS_ID   = 0
+SMOOTH_ALPHA        = 0.35   # EMA weight for new measurement (lower = smoother)
 
 CLASS_NAMES = {
     0: "cylinder",
@@ -102,6 +104,24 @@ state = {
 }
 
 
+# ── cylinder EMA smoother ─────────────────────────────────────────────────────
+class CylinderTracker:
+    """Exponential moving average over the cylinder's 3D position."""
+    def __init__(self, alpha=SMOOTH_ALPHA):
+        self.alpha = alpha
+        self.xyz   = None
+
+    def update(self, xyz):
+        if xyz is None:
+            return self.xyz
+        m = np.array(xyz, dtype=float)
+        self.xyz = m if self.xyz is None else self.alpha * m + (1 - self.alpha) * self.xyz
+        return tuple(self.xyz)
+
+    def reset(self):
+        self.xyz = None
+
+
 # ── depth helper ──────────────────────────────────────────────────────────────
 def get_median_depth(depth_frame, u, v, radius=DEPTH_SAMPLE_RADIUS):
     h, w = depth_frame.get_height(), depth_frame.get_width()
@@ -128,6 +148,35 @@ def get_xyz(x, y):
         print(f"  [!] No valid depth at ({x},{y}) — raw={raw:.3f} m  (too close / reflective?)")
         return None
     return tuple(rs.rs2_deproject_pixel_to_point(intrinsics, [float(x), float(y)], depth_m))
+
+
+def get_bbox_depth(depth_frame, x1, y1, x2, y2, inner_pct=0.5):
+    """Median depth sampled from the inner inner_pct of the bounding box.
+
+    Sampling from the bbox interior avoids edge pixels that mix foreground
+    and background depth, giving a cleaner reading on the cylinder body.
+    The weighted centroid pixel is returned alongside the depth for accurate
+    3D deprojection.
+    """
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    hw = max(2, int((x2 - x1) * inner_pct / 2))
+    hh = max(2, int((y2 - y1) * inner_pct / 2))
+    h_img, w_img = depth_frame.get_height(), depth_frame.get_width()
+    u0 = max(0, int(cx) - hw);  u1 = min(w_img - 1, int(cx) + hw)
+    v0 = max(0, int(cy) - hh);  v1 = min(h_img - 1, int(cy) + hh)
+    pts = []
+    for row in range(v0, v1 + 1):
+        for col in range(u0, u1 + 1):
+            d = depth_frame.get_distance(col, row)
+            if d > 0:
+                pts.append((d, col, row))
+    if not pts:
+        return 0.0, int(cx), int(cy)
+    depths = [d for d, _, _ in pts]
+    med    = float(np.median(depths))
+    # Use the pixel whose depth is closest to the median for deprojection
+    best   = min(pts, key=lambda t: abs(t[0] - med))
+    return med, best[1], best[2]
 
 
 # ── height helper ─────────────────────────────────────────────────────────────
@@ -328,26 +377,51 @@ def draw_track_hud(frame, detections):
 
 
 # ── detection helper ──────────────────────────────────────────────────────────
-def run_detections(model, color_img, depth_frame, intrinsics, conf, imgsz, classes):
+def run_detections(model, color_img, depth_frame, intrinsics, conf, imgsz, classes,
+                   cylinder_only=True, tracker=None):
+    """Run YOLO and return detections.
+
+    When cylinder_only=True, only the highest-confidence cylinder box is kept.
+    Depth is sampled from the inner 50 % of the bounding box for accuracy.
+    If tracker is provided, the cylinder XYZ is EMA-smoothed.
+    """
     results = model.predict(color_img, conf=conf, imgsz=imgsz,
                             classes=classes, verbose=False)[0]
     detections = []
     if results.boxes is None:
         return detections
+
     for box in results.boxes:
-        cls_id      = int(box.cls[0])
-        confidence  = float(box.conf[0])
+        cls_id     = int(box.cls[0])
+        confidence = float(box.conf[0])
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cx, cy      = (x1 + x2) // 2, (y1 + y2) // 2
-        depth_m     = get_median_depth(depth_frame, cx, cy)
+        cx, cy     = (x1 + x2) // 2, (y1 + y2) // 2
+
+        if cylinder_only and cls_id != CYLINDER_CLASS_ID:
+            continue
+
         xyz = None
-        if depth_m > 0:
-            xyz = tuple(rs.rs2_deproject_pixel_to_point(
-                intrinsics, [float(cx), float(cy)], depth_m))
+        if cls_id == CYLINDER_CLASS_ID:
+            depth_m, px, py = get_bbox_depth(depth_frame, x1, y1, x2, y2, inner_pct=0.5)
+            if depth_m > 0:
+                raw_xyz = tuple(rs.rs2_deproject_pixel_to_point(
+                    intrinsics, [float(px), float(py)], depth_m))
+                xyz = tracker.update(raw_xyz) if tracker else raw_xyz
+        else:
+            depth_m = get_median_depth(depth_frame, cx, cy)
+            if depth_m > 0:
+                xyz = tuple(rs.rs2_deproject_pixel_to_point(
+                    intrinsics, [float(cx), float(cy)], depth_m))
+
         detections.append({
             "cls_id": cls_id, "conf": confidence,
             "bbox": (x1, y1, x2, y2), "center": (cx, cy), "xyz": xyz,
         })
+
+    if cylinder_only and len(detections) > 1:
+        # Keep only the highest-confidence cylinder to avoid ambiguity
+        detections = [max(detections, key=lambda d: d["conf"])]
+
     return detections
 
 
@@ -426,9 +500,14 @@ def main():
     p.add_argument("--weights",  default=DEFAULT_WEIGHTS)
     p.add_argument("--conf",     type=float, default=0.6)
     p.add_argument("--imgsz",    type=int,   default=320)
-    p.add_argument("--classes",  type=int,   nargs="+", default=None,
-                   help="Class IDs to detect (default: all). "
+    p.add_argument("--classes",  type=int,   nargs="+", default=[CYLINDER_CLASS_ID],
+                   help="Class IDs to detect (default: 0=cylinder only). "
                         "0=cylinder 1=peg_inactive 2=peg_lit_blue 3=peg_lit_white")
+    p.add_argument("--all-classes", action="store_true",
+                   help="Detect all classes (overrides --classes).")
+    p.add_argument("--smooth", type=float, default=SMOOTH_ALPHA, metavar="ALPHA",
+                   help=f"EMA smoothing for cylinder XYZ (0=max smooth, 1=raw). "
+                        f"Default: {SMOOTH_ALPHA}")
     p.add_argument("--skip-cal", action="store_true",
                    help="Skip level calibration; use raw camera Y as height axis.")
     p.add_argument("--skip-map", action="store_true",
@@ -437,6 +516,13 @@ def main():
     p.add_argument("--height",   type=int, default=480)
     args = p.parse_args()
 
+    if args.all_classes:
+        args.classes = None
+
+    cylinder_only = (args.classes is not None and
+                     args.classes == [CYLINDER_CLASS_ID])
+    tracker = CylinderTracker(alpha=args.smooth)
+
     weights = Path(args.weights)
     if not weights.exists():
         print(f"Weights not found: {weights}")
@@ -444,8 +530,10 @@ def main():
 
     print(f"Loading model: {weights}")
     model = YOLO(str(weights))
+    cls_label = "cylinder only" if cylinder_only else (
+        str(args.classes) if args.classes else "all")
     print(f"Confidence: {args.conf}  |  Inference size: {args.imgsz}  |  "
-          f"Classes: {args.classes if args.classes else 'all'}")
+          f"Classes: {cls_label}  |  EMA alpha: {args.smooth}")
 
     pipeline = rs.pipeline()
     config   = rs.config()
@@ -531,6 +619,7 @@ def main():
                     if not state["pegs"]:
                         print("  [!] No pegs registered yet — click at least one.")
                     elif args.skip_map:
+                        tracker.reset()
                         state["phase"] = PHASE_TRACK
                         print(f"\n--- PHASE 3: TRACK ---")
                         print(f"Tracking with {len(state['pegs'])} peg reference(s). q = quit.\n")
@@ -543,6 +632,7 @@ def main():
                             print("\n--- PHASE 1b: REGISTER (back) ---")
                             print("Pegs kept. Add/undo with left-click / u. Enter when done.\n")
                         elif action == "track":
+                            tracker.reset()
                             state["phase"] = PHASE_TRACK
                             print(f"\n--- PHASE 3: TRACK ---")
                             print(f"Tracking with {len(state['pegs'])} peg reference(s). q = quit.\n")
@@ -553,7 +643,8 @@ def main():
             else:
                 detections = run_detections(
                     model, color_img, depth_frame, state["intrinsics"],
-                    args.conf, args.imgsz, args.classes
+                    args.conf, args.imgsz, args.classes,
+                    cylinder_only=cylinder_only, tracker=tracker,
                 )
                 draw_track_hud(frame, detections)
                 cv2.imshow("Camera", frame)

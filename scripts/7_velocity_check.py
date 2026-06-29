@@ -39,7 +39,7 @@ from geometry_msgs.msg import PoseStamped
 from ultralytics import YOLO
 
 CYLINDER_CLASS_ID = 0
-DEFAULT_WEIGHTS   = "models/best_v2.pt"
+DEFAULT_WEIGHTS   = "models/best_v3.pt"
 DEFAULT_TOPIC     = "/camera_left/compressed"
 
 STATE_STATIONARY = "STATIONARY"
@@ -268,9 +268,7 @@ class CylinderVelocityNode(Node):
     def __init__(self, topic: str, model: YOLO, conf: float, imgsz: int,
                  vel_stat: float, vel_drop: float, lost_frames: int,
                  vel_window: int, spike_frames: int, settle_frames: int,
-                 max_jump: float, drop_timeout: float, log_path,
-                 xgb_model=None, xgb_le=None, xgb_window=5,
-                 settings: dict = None):
+                 max_jump: float, drop_timeout: float, log_path, settings: dict = None):
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', topic)
         safe = re.sub(r'_+', '_', safe).strip('_')
         super().__init__(f"cylinder_velocity_{safe}")
@@ -339,11 +337,6 @@ class CylinderVelocityNode(Node):
             PoseStamped, "/PSM1/measured_cp", self._psm1_cb, qos)
         self.get_logger().info(f"Subscribed to {topic}")
 
-        self._xgb_model  = xgb_model
-        self._xgb_le     = xgb_le
-        self._xgb_window = xgb_window
-        self._feat_buf   = deque(maxlen=xgb_window)
-
         self._stop        = threading.Event()
         self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
         self._infer_thread.start()
@@ -401,28 +394,7 @@ class CylinderVelocityNode(Node):
         x1, y1, x2, y2 = best
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0, x1, y1, x2, y2
 
-    def _xgb_classify(self, smoothed: float, cx: float, cy: float):
-        """Build feature row, push to lag buffer, return predicted state or None if not ready."""
-        with self._psm1_lock:
-            pose = self._psm1_pose
-        if pose is None:
-            return None
-        p, q = pose.pose.position, pose.pose.orientation
-        feat_row = np.array([smoothed, cx, cy,
-                             p.x, p.y, p.z,
-                             q.x, q.y, q.z, q.w], dtype=np.float32)
-        self._feat_buf.append(feat_row)
-        if len(self._feat_buf) < self._xgb_window:
-            return None
-        arr     = np.array(self._feat_buf, dtype=np.float32)
-        current = arr[-1]
-        lags    = arr[:-1][::-1].flatten()
-        delta   = current - arr[-2]
-        feat    = np.concatenate([current, lags, delta]).reshape(1, -1)
-        pred_int = self._xgb_model.predict(feat)[0]
-        return self._xgb_le.inverse_transform([pred_int])[0]
-
-    # handles state transitions
+    # handles state transitions 
     def _set_state(self, new_state: str, vel: float, center):
         if new_state == self._state:
             return
@@ -446,18 +418,12 @@ class CylinderVelocityNode(Node):
             self._lost_count  += 1
             self._spike_count  = 0
             self._settle_count = 0
+            if (self._lost_count >= self.lost_frames
+                    and self._state != STATE_LOST):
+                self._set_state(STATE_LOST, 0.0, None)
             self._prev_center = None
             self._prev_time   = None
             smoothed = self._vel_hist[-1] if self._vel_hist else 0.0
-            if self._xgb_model is not None:
-                new_state = self._xgb_classify(smoothed, -1.0, -1.0)
-                if new_state is not None:
-                    self._set_state(new_state, 0.0, None)
-                elif self._lost_count >= self.lost_frames and self._state != STATE_LOST:
-                    self._set_state(STATE_LOST, 0.0, None)
-            else:
-                if self._lost_count >= self.lost_frames and self._state != STATE_LOST:
-                    self._set_state(STATE_LOST, 0.0, None)
             self._finish(out, None, smoothed, now)
             return out
 
@@ -491,37 +457,34 @@ class CylinderVelocityNode(Node):
         self._vel_hist.append(raw_disp)
         smoothed = float(np.mean(self._vel_hist))
 
-        if self._xgb_model is not None:
-            new_state = self._xgb_classify(smoothed, cx, cy)
-            if new_state is not None:
-                self._set_state(new_state, smoothed, center)
+        # spike counter: require N consecutive raw-disp spikes before DROPPED
+        if raw_disp >= self.vel_drop:
+            self._spike_count += 1
         else:
-            # spike counter: require N consecutive raw-disp spikes before DROPPED
-            if raw_disp >= self.vel_drop:
-                self._spike_count += 1
-            else:
-                self._spike_count = 0
+            self._spike_count = 0
 
-            # settle counter: require N consecutive frames below vel_stat before STATIONARY
-            if smoothed < self.vel_stat:
-                self._settle_count += 1
-            else:
-                self._settle_count = 0
+        # settle counter: require N consecutive frames below vel_stat before STATIONARY
+        if smoothed < self.vel_stat:
+            self._settle_count += 1
+        else:
+            self._settle_count = 0
 
-            if self._spike_count >= self.spike_frames:
-                self._set_state(STATE_DROPPED, raw_disp, center)
-                self._spike_count = 0
-            elif self._state == STATE_DROPPED:
-                timed_out = (self._dropped_at is not None and
-                             now - self._dropped_at >= self.drop_timeout)
-                if self._settle_count >= self.settle_frames or timed_out:
-                    self._set_state(STATE_STATIONARY, smoothed, center)
-            elif self._state == STATE_LOST:
-                self._set_state(STATE_HELD, smoothed, center)
-            elif self._settle_count >= self.settle_frames:
+        if self._spike_count >= self.spike_frames:
+            self._set_state(STATE_DROPPED, raw_disp, center)
+            self._spike_count = 0
+        elif self._state == STATE_DROPPED:
+            # exit via settle OR via timeout (cylinder stopped bouncing)
+            timed_out = (self._dropped_at is not None and
+                         now - self._dropped_at >= self.drop_timeout)
+            if self._settle_count >= self.settle_frames or timed_out:
                 self._set_state(STATE_STATIONARY, smoothed, center)
-            else:
-                self._set_state(STATE_HELD, smoothed, center)
+        elif self._state == STATE_LOST:
+            # cylinder re-appeared → go to HELD immediately, settle to STATIONARY normally
+            self._set_state(STATE_HELD, smoothed, center)
+        elif self._settle_count >= self.settle_frames:
+            self._set_state(STATE_STATIONARY, smoothed, center)
+        else:
+            self._set_state(STATE_HELD, smoothed, center)
 
         color = STATE_COLORS[self._state]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
@@ -622,18 +585,6 @@ def main():
     rclpy.init()
     model = YOLO(args.weights)
     print(f"[INFO] Loaded weights: {args.weights}")
-
-    xgb_model = xgb_le = None
-    if args.model:
-        from xgboost import XGBClassifier
-        import joblib
-        xgb_model = XGBClassifier()
-        xgb_model.load_model(args.model)
-        le_path = args.model.replace(".json", ".labels.pkl")
-        xgb_le  = joblib.load(le_path)
-        print(f"[INFO] XGBoost model: {args.model}  (window={args.window})")
-    else:
-        print(f"[INFO] Mode:           rule-based thresholds")
     print(f"[INFO] Topic:          {args.topic}")
     print(f"[INFO] Confidence:     {args.conf}")
     print(f"[INFO] Inference size: {args.imgsz}")
@@ -681,9 +632,7 @@ def main():
         args.topic, model, args.conf, args.imgsz,
         args.vel_stat, args.vel_drop, args.lost, args.vel_window,
         args.spike_frames, args.settle_frames, args.max_jump,
-        args.drop_timeout, args.log,
-        xgb_model=xgb_model, xgb_le=xgb_le, xgb_window=args.window,
-        settings=settings)
+        args.drop_timeout, args.log, settings)
 
     executor    = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
@@ -751,10 +700,8 @@ def parse_args():
     p.add_argument("--title",                     default=None,             help="Optional session title written as first comment in the CSV")
     p.add_argument("--max-jump",      type=float, default=800.0,            help="Max implied speed (px/s) before a detection is rejected as spurious")
     p.add_argument("--drop-timeout",  type=float, default=2.0,              help="Seconds before DROPPED auto-resets to STATIONARY if settle never triggers")
-    p.add_argument("--mode",                      default="velocity",
+    p.add_argument("--mode",                      default="velocity", 
                                         choices=["velocity", "dist"],       help="'velocity' shows time-series plot; 'dist' shows histogram of all samples")
-    p.add_argument("--model",                     default=None,             help="XGBoost model .json — replaces rule-based thresholds")
-    p.add_argument("--window",         type=int,   default=5,               help="Feature lag window (must match training default, default 5)")
     return p.parse_args()
 
 

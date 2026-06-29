@@ -70,7 +70,7 @@ CLASS_COLORS = {
     3: (255, 255,   0), # yellow
 }
 
-DEFAULT_WEIGHTS = "models/best_v2.pt"
+DEFAULT_WEIGHTS = "models/best_v3.pt"
 
 
 # ---------------------------------------------------------------------------
