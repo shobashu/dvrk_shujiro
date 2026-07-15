@@ -1,0 +1,34 @@
+bag_file: trial_002_20260630_160313.db3
+source_fps: 30.0
+target_fps: 2.0
+frame_step: 15
+n_frames: 195
+n_raw_frames: 2925
+jpeg_quality: 95
+has_depth: true
+intrinsics: &id001
+  fx: 392.4035339355469
+  fy: 391.98577880859375
+  ppx: 319.79937744140625
+  ppy: 242.04055786132812
+  width: 640
+  height: 480
+  model: distortion.inverse_brown_conrady
+  coeffs:
+  - -0.055710624903440475
+  - 0.06032084673643112
+  - -0.0008619414875283837
+  - 0.000507691060192883
+  - -0.01999235525727272
+session:
+  bag_file: trial_002_20260630_160313.db3
+  timestamp: '2026-06-30T16:04:50'
+  duration_s: 97.403
+  n_frames: 2925
+  camera_settings:
+    depth_exposure: 9501.0
+    depth_gain: 16.0
+    laser_power: null
+    color_exposure: 9501.0
+    white_balance: 4100.0
+  intrinsics: *id001

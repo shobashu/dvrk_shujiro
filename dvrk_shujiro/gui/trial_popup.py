@@ -14,6 +14,9 @@ Lifecycle:
 import tkinter as tk
 import time
 
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
 MAX_TIME_SEC = 60 # time limit (seconds)
 
 # ── Popup display settings ────────────────────────────────────────────────────
@@ -21,6 +24,11 @@ POPUP_WIDTH     = 300
 POPUP_HEIGHT    = 100
 POPUP_SHOW_MS   = 2000      # how long result stays visible before hiding (ms)
 UPDATE_MS       = 33        # refresh rate (30fps = 33ms, 20fps = 50ms)
+
+# ── Force result popup settings ───────────────────────────────────────────────
+FORCE_POPUP_WIDTH  = 360
+FORCE_POPUP_HEIGHT = 290
+FORCE_POPUP_SHOW_MS = 4000  # longer than the plain popup — there's a graph to read
 
 # Time thresholds for bar color (seconds) — matches your existing timer logic
 THRESHOLD_ORANGE = MAX_TIME_SEC * 0.70   # 70% → orange  (same as PROGRESS_YELLOW_THRESHOLD)
@@ -39,7 +47,9 @@ COLORS = {
     'text_dim'   : '#606060',
     'text_bright': '#909090',
     'text_done'  : '#80c060',
-    'text_failed': '#c06060',    
+    'text_failed': '#c06060',
+    'force_line' : '#e0904a',
+    'force_peak' : '#e05050',
 }
 
 
@@ -61,13 +71,18 @@ class TrialPopup:
         self._win        = None
         self._start_time = None
         self._running    = False
+        self._force_canvases = []
 
         # Score tracking
         self.trial_count   = 0
         self.placed_count  = 0
-        self.failed_count  = 0          
+        self.failed_count  = 0
         self.trial_times   = []
-        self.failed_times  = []         
+        self.failed_times  = []
+
+        # Color-match (target color facing down) success tracking
+        self.color_checked_count = 0   # trials where a down_color/success reading was available
+        self.color_success_count = 0
 
     # ── Thread-safe API (call these from the Arduino background thread) ────────
 
@@ -78,6 +93,24 @@ class TrialPopup:
     def complete_threadsafe(self):
         """Call from Arduino thread when PEG PLACED is detected."""
         self._root.after(0, self._complete)
+
+    def show_force_result_threadsafe(self, trial_num, times, forces, peak, mean,
+                                      orientation_deg=None, orientation_ok=None,
+                                      down_color=None, success=None):
+        """Call from Arduino thread when 'Object returned successfully.' is detected.
+
+        times/forces: parallel lists — elapsed seconds since trial start, and
+        the ATI sensor's total force magnitude ‖F‖ (N) at that instant.
+        orientation_deg/orientation_ok: optional cylinder orientation angle (0° = upright)
+        and whether it was within tolerance, measured at the "Target hit" event mid-trial.
+        down_color: "blue" or "white" — whichever color was facing down at that same moment.
+        success: whether down_color matched the trial's target color — the actual
+        placement-correctness signal used for the running success rate.
+        Pass None for all four if no orientation reading is available for this trial.
+        """
+        self._root.after(0, lambda: self._show_force_result(
+            trial_num, times, forces, peak, mean, orientation_deg, orientation_ok,
+            down_color, success))
 
     # ── Score summary (call at end of session) ────────────────────────────────
 
@@ -106,7 +139,12 @@ class TrialPopup:
         if self.trial_count > 0:
             success_rate = (self.placed_count / self.trial_count) * 100
             print(f"\n  Success rate     : {success_rate:.1f}%")
-        
+
+        if self.color_checked_count > 0:
+            color_rate = (self.color_success_count / self.color_checked_count) * 100
+            print(f"  Color-match rate : {color_rate:.1f}%  "
+                  f"({self.color_success_count}/{self.color_checked_count})")
+
         print("=" * 40 + "\n")
 
     # ── Internal — main thread only ───────────────────────────────────────────
@@ -358,6 +396,120 @@ class TrialPopup:
         # Auto-hide after POPUP_SHOW_MS
         self._root.after(POPUP_SHOW_MS, self._hide)
 
+    def _show_force_result(self, trial_num, times, forces, peak, mean,
+                            orientation_deg=None, orientation_ok=None,
+                            down_color=None, success=None):
+        """Replace the progress popup with a force-vs-time graph + peak/mean, on all monitors."""
+        self._running = False
+        self._hide()
+
+        monitors = [
+            {'name': 'HDMI-1', 'x': 1280, 'y': 0, 'width': 3840, 'height': 2160},
+            {'name': 'DP-0',   'x': 640,  'y': 0, 'width': 640,  'height': 480},
+            {'name': 'DP-2',   'x': 0,    'y': 0, 'width': 640,  'height': 480},
+        ]
+        MARGIN_X = 20
+        MARGIN_Y = 20
+
+        self._wins = []
+        for monitor in monitors:
+            win = self._create_force_popup_window(
+                x=monitor['x'] + MARGIN_X, y=monitor['y'] + MARGIN_Y,
+                trial_num=trial_num, times=times, forces=forces, peak=peak, mean=mean,
+                orientation_deg=orientation_deg, orientation_ok=orientation_ok,
+                down_color=down_color, success=success
+            )
+            self._wins.append(win)
+
+        print(f"\n[Trial {trial_num}] Peak force: {peak:.2f} N  |  Mean force: {mean:.2f} N")
+        if orientation_deg is not None:
+            print(f"[Trial {trial_num}] Orientation: {'OK' if orientation_ok else 'OFF'} "
+                  f"({orientation_deg:+.1f}°)  —  {down_color} facing down")
+
+        if success is not None:
+            self.color_checked_count += 1
+            if success:
+                self.color_success_count += 1
+            rate = 100.0 * self.color_success_count / self.color_checked_count
+            print(f"[Trial {trial_num}] Placement: {'SUCCESS' if success else 'FAIL'}")
+            print(f"[Score] Color-match success rate: "
+                  f"{self.color_success_count}/{self.color_checked_count} ({rate:.1f}%)")
+
+        self._root.after(FORCE_POPUP_SHOW_MS, self._hide)
+
+    def _create_force_popup_window(self, x, y, trial_num, times, forces, peak, mean,
+                                    orientation_deg=None, orientation_ok=None,
+                                    down_color=None, success=None):
+        """Helper to build one force-result popup (title + peak/mean + orientation + graph)."""
+        win = tk.Toplevel(self._root)
+        win.title("")
+        win.configure(bg=COLORS['bg'])
+        win.attributes('-topmost', True)
+        win.attributes('-alpha', 0.92)
+        win.overrideredirect(True)
+        win.lift()
+        win.geometry(f"{FORCE_POPUP_WIDTH}x{FORCE_POPUP_HEIGHT}+{x}+{y}")
+
+        border = tk.Frame(win, bg=COLORS['border'], padx=1, pady=1)
+        border.pack(fill='both', expand=True)
+        inner = tk.Frame(border, bg=COLORS['bg'], padx=10, pady=8)
+        inner.pack(fill='both', expand=True)
+
+        title = tk.Label(
+            inner, text=f"TRIAL {trial_num} — FORCE APPLIED",
+            font=("Arial", 10, "bold"), fg=COLORS['text_bright'], bg=COLORS['bg']
+        )
+        title.pack(anchor='w')
+
+        stats = tk.Label(
+            inner, text=f"Peak: {peak:.2f} N     Mean: {mean:.2f} N",
+            font=("Arial", 11, "bold"), fg=COLORS['text_done'], bg=COLORS['bg']
+        )
+        stats.pack(anchor='w', pady=(2, 2))
+
+        if orientation_deg is not None:
+            if success is not None:
+                ori_color = COLORS['text_done'] if success else COLORS['text_failed']
+                ori_text  = f"{'SUCCESS' if success else 'FAIL'}  —  {down_color} down  ({orientation_deg:+.1f}°)"
+            else:
+                ori_color = COLORS['text_dim']
+                ori_text  = f"Orientation: {orientation_deg:+.1f}°"
+                if down_color is not None:
+                    ori_text += f"  ({down_color} down)"
+            ori_label = tk.Label(
+                inner, text=ori_text,
+                font=("Arial", 11, "bold"), fg=ori_color, bg=COLORS['bg']
+            )
+            ori_label.pack(anchor='w', pady=(0, 4))
+
+        fig = Figure(figsize=(FORCE_POPUP_WIDTH / 100, 1.6), dpi=100)
+        fig.patch.set_facecolor(COLORS['bg'])
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(COLORS['bg'])
+
+        if times:
+            ax.plot(times, forces, color=COLORS['force_line'], linewidth=1.8)
+            peak_idx = forces.index(max(forces))
+            ax.plot(times[peak_idx], forces[peak_idx], 'o',
+                    color=COLORS['force_peak'], markersize=5, zorder=3)
+        else:
+            ax.text(0.5, 0.5, "no force data", ha='center', va='center',
+                    color=COLORS['text_dim'], fontsize=8, transform=ax.transAxes)
+
+        ax.tick_params(colors=COLORS['text_dim'], labelsize=7)
+        for spine in ax.spines.values():
+            spine.set_color(COLORS['border'])
+        ax.set_xlabel("time (s)", color=COLORS['text_dim'], fontsize=7)
+        ax.set_ylabel("‖F‖ (N)", color=COLORS['text_dim'], fontsize=7)
+        fig.tight_layout(pad=0.3)
+
+        canvas = FigureCanvasTkAgg(fig, master=inner)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill='both', expand=True)
+        self._force_canvases.append(canvas)
+
+        return win
+
     def _hide(self):
         """Destroy all popup windows."""
         if hasattr(self, '_wins') and self._wins:
@@ -372,6 +524,7 @@ class TrialPopup:
             self._time_labels = []
             self._titles = []
             self._statuses = []
+        self._force_canvases = []
 
     def _fmt(self, seconds):
         """Format seconds as MM:SS.T  e.g. 75.3 → '01:15.3'"""

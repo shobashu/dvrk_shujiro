@@ -103,6 +103,7 @@ void runTrial() {
 
   Serial.print("\n--- Trial "); Serial.print(currentTrial + 1); Serial.println(" ---");
   Serial.print("Waiting for lift from Center Peg "); Serial.println(centerIdx + 1);
+  Serial.print("CUE,"); Serial.println(targetColor == 0 ? "Blue" : "White");
 
   // 1. Indicate Pair & Record Cue Time
   cueTime = millis();
