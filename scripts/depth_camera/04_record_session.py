@@ -102,7 +102,7 @@ def bag_size_mb(path):
         return 0.0
 
 
-def save_metadata(json_path, bag_stem, settings, intrinsics, n_frames, duration_s):
+def save_metadata(json_path, bag_stem, settings, intrinsics, n_frames, duration_s, depth_scale):
     meta = {
         "bag_file":       bag_stem + ".db3",
         "timestamp":      datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -110,6 +110,7 @@ def save_metadata(json_path, bag_stem, settings, intrinsics, n_frames, duration_
         "n_frames":       n_frames,
         "camera_settings": settings,
         "intrinsics":     intrinsics,
+        "depth_scale":    depth_scale,   # metres per raw depth unit — sensor-reported, not assumed
     }
     json_path.write_text(json.dumps(meta, indent=2))
     print(f"  Metadata → {json_path.name}")
@@ -161,6 +162,9 @@ def main():
 
     depth_sensor = device.first_depth_sensor()
     color_sensor = find_color_sensor(device)
+
+    depth_scale = depth_sensor.get_depth_scale()   # metres per raw depth unit (D405: ~0.0001)
+    print(f"  Depth scale = {depth_scale} m/unit")
 
     depth_sensor.set_option(rs.option.enable_auto_exposure,      0)
     color_sensor.set_option(rs.option.enable_auto_exposure,      0)
@@ -241,7 +245,7 @@ def main():
                     print(f"  ■ Recording stopped  |  {n_frames} frames  |  "
                           f"{duration:.1f} s  |  {bag_size_mb(bag_path):.1f} MB")
                     save_metadata(json_path, stem, settings, intrinsics,
-                                  n_frames, duration)
+                                  n_frames, duration, depth_scale)
                     print(f"  Saved → {bag_path.name}\n")
                     print("Press Space to start a new recording.  q to quit.\n")
 
@@ -255,7 +259,7 @@ def main():
                     print(f"  ■ {n_frames} frames  |  {duration:.1f} s  |  "
                           f"{bag_size_mb(bag_path):.1f} MB")
                     save_metadata(json_path, stem, settings, intrinsics,
-                                  n_frames, duration)
+                                  n_frames, duration, depth_scale)
                     print(f"  Saved → {bag_path.name}")
                 break
 

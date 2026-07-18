@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import threading
 import time
@@ -39,7 +40,7 @@ from geometry_msgs.msg import PoseStamped
 from ultralytics import YOLO
 
 CYLINDER_CLASS_ID = 0
-DEFAULT_WEIGHTS   = "models/best_v3.pt"
+DEFAULT_WEIGHTS   = "models/best_v2.pt"
 DEFAULT_TOPIC     = "/camera_left/compressed"
 
 STATE_STATIONARY = "STATIONARY"
@@ -268,7 +269,9 @@ class CylinderVelocityNode(Node):
     def __init__(self, topic: str, model: YOLO, conf: float, imgsz: int,
                  vel_stat: float, vel_drop: float, lost_frames: int,
                  vel_window: int, spike_frames: int, settle_frames: int,
-                 max_jump: float, drop_timeout: float, log_path, settings: dict = None):
+                 max_jump: float, drop_timeout: float, log_path, record_path,
+                 xgb_model=None, xgb_le=None, xgb_window=5,
+                 settings: dict = None):
         safe = re.sub(r'[^a-zA-Z0-9_]', '_', topic)
         safe = re.sub(r'_+', '_', safe).strip('_')
         super().__init__(f"cylinder_velocity_{safe}")
@@ -327,15 +330,28 @@ class CylinderVelocityNode(Node):
                     if k != "title":
                         self._log_file.write(f"# {k}={v}\n")
             self._log_file.write(
-                "timestamp_s,state,vel_px_s,cx,cy,"
+                "frame_idx,timestamp_s,state,vel_px_s,cx,cy,"
                 "psm1_x,psm1_y,psm1_z,psm1_qx,psm1_qy,psm1_qz,psm1_qw\n")
         self._start_time = time.time()
+
+        # video recording — written from the same call site as the CSV row
+        # (_finish, inference thread) so frame_idx N in the CSV is always
+        # exactly frame N of the mp4, with a matching timestamp.
+        self._record_path   = record_path
+        self._video_writer  = None
+        self._record_failed = False
+        self._frame_idx     = 0
 
         qos = QoSPresetProfiles.SENSOR_DATA.value
         self.sub = self.create_subscription(CompressedImage, topic, self._cb, qos)
         self.sub_psm1 = self.create_subscription(
             PoseStamped, "/PSM1/measured_cp", self._psm1_cb, qos)
         self.get_logger().info(f"Subscribed to {topic}")
+
+        self._xgb_model  = xgb_model
+        self._xgb_le     = xgb_le
+        self._xgb_window = xgb_window
+        self._feat_buf   = deque(maxlen=xgb_window)
 
         self._stop        = threading.Event()
         self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True)
@@ -394,7 +410,28 @@ class CylinderVelocityNode(Node):
         x1, y1, x2, y2 = best
         return (x1 + x2) / 2.0, (y1 + y2) / 2.0, x1, y1, x2, y2
 
-    # handles state transitions 
+    def _xgb_classify(self, smoothed: float, cx: float, cy: float):
+        """Build feature row, push to lag buffer, return predicted state or None if not ready."""
+        with self._psm1_lock:
+            pose = self._psm1_pose
+        if pose is None:
+            return None
+        p, q = pose.pose.position, pose.pose.orientation
+        feat_row = np.array([smoothed, cx, cy,
+                             p.x, p.y, p.z,
+                             q.x, q.y, q.z, q.w], dtype=np.float32)
+        self._feat_buf.append(feat_row)
+        if len(self._feat_buf) < self._xgb_window:
+            return None
+        arr     = np.array(self._feat_buf, dtype=np.float32)
+        current = arr[-1]
+        lags    = arr[:-1][::-1].flatten()
+        delta   = current - arr[-2]
+        feat    = np.concatenate([current, lags, delta]).reshape(1, -1)
+        pred_int = self._xgb_model.predict(feat)[0]
+        return self._xgb_le.inverse_transform([pred_int])[0]
+
+    # handles state transitions
     def _set_state(self, new_state: str, vel: float, center):
         if new_state == self._state:
             return
@@ -418,12 +455,18 @@ class CylinderVelocityNode(Node):
             self._lost_count  += 1
             self._spike_count  = 0
             self._settle_count = 0
-            if (self._lost_count >= self.lost_frames
-                    and self._state != STATE_LOST):
-                self._set_state(STATE_LOST, 0.0, None)
             self._prev_center = None
             self._prev_time   = None
             smoothed = self._vel_hist[-1] if self._vel_hist else 0.0
+            if self._xgb_model is not None:
+                new_state = self._xgb_classify(smoothed, -1.0, -1.0)
+                if new_state is not None:
+                    self._set_state(new_state, 0.0, None)
+                elif self._lost_count >= self.lost_frames and self._state != STATE_LOST:
+                    self._set_state(STATE_LOST, 0.0, None)
+            elif (self._lost_count >= self.lost_frames
+                    and self._state != STATE_LOST):
+                self._set_state(STATE_LOST, 0.0, None)
             self._finish(out, None, smoothed, now)
             return out
 
@@ -457,34 +500,39 @@ class CylinderVelocityNode(Node):
         self._vel_hist.append(raw_disp)
         smoothed = float(np.mean(self._vel_hist))
 
-        # spike counter: require N consecutive raw-disp spikes before DROPPED
-        if raw_disp >= self.vel_drop:
-            self._spike_count += 1
+        if self._xgb_model is not None:
+            new_state = self._xgb_classify(smoothed, cx, cy)
+            if new_state is not None:
+                self._set_state(new_state, smoothed, center)
         else:
-            self._spike_count = 0
+            # spike counter: require N consecutive raw-disp spikes before DROPPED
+            if raw_disp >= self.vel_drop:
+                self._spike_count += 1
+            else:
+                self._spike_count = 0
 
-        # settle counter: require N consecutive frames below vel_stat before STATIONARY
-        if smoothed < self.vel_stat:
-            self._settle_count += 1
-        else:
-            self._settle_count = 0
+            # settle counter: require N consecutive frames below vel_stat before STATIONARY
+            if smoothed < self.vel_stat:
+                self._settle_count += 1
+            else:
+                self._settle_count = 0
 
-        if self._spike_count >= self.spike_frames:
-            self._set_state(STATE_DROPPED, raw_disp, center)
-            self._spike_count = 0
-        elif self._state == STATE_DROPPED:
-            # exit via settle OR via timeout (cylinder stopped bouncing)
-            timed_out = (self._dropped_at is not None and
-                         now - self._dropped_at >= self.drop_timeout)
-            if self._settle_count >= self.settle_frames or timed_out:
+            if self._spike_count >= self.spike_frames:
+                self._set_state(STATE_DROPPED, raw_disp, center)
+                self._spike_count = 0
+            elif self._state == STATE_DROPPED:
+                # exit via settle OR via timeout (cylinder stopped bouncing)
+                timed_out = (self._dropped_at is not None and
+                             now - self._dropped_at >= self.drop_timeout)
+                if self._settle_count >= self.settle_frames or timed_out:
+                    self._set_state(STATE_STATIONARY, smoothed, center)
+            elif self._state == STATE_LOST:
+                # cylinder re-appeared → go to HELD immediately, settle to STATIONARY normally
+                self._set_state(STATE_HELD, smoothed, center)
+            elif self._settle_count >= self.settle_frames:
                 self._set_state(STATE_STATIONARY, smoothed, center)
-        elif self._state == STATE_LOST:
-            # cylinder re-appeared → go to HELD immediately, settle to STATIONARY normally
-            self._set_state(STATE_HELD, smoothed, center)
-        elif self._settle_count >= self.settle_frames:
-            self._set_state(STATE_STATIONARY, smoothed, center)
-        else:
-            self._set_state(STATE_HELD, smoothed, center)
+            else:
+                self._set_state(STATE_HELD, smoothed, center)
 
         color = STATE_COLORS[self._state]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
@@ -509,9 +557,47 @@ class CylinderVelocityNode(Node):
         self._finish(out, center, smoothed, now)
         return out
 
+    def _open_video_writer(self, hw: tuple):
+        """Open self._record_path for writing, verifying isOpened() (cv2 stays
+        silent and just drops every frame if the codec fails to open).
+        Falls back to MJPG/.avi, which is supported by virtually every
+        OpenCV build, so a recording is never silently lost again."""
+        h, w = hw
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(self._record_path, fourcc, 30.0, (w, h))
+        if writer.isOpened():
+            print(f"[INFO] Recording started -> {self._record_path}")
+            return writer
+        writer.release()
+        print(f"[WARN] mp4v codec failed to open for {self._record_path}; "
+              f"falling back to MJPG/.avi")
+
+        base, _ext = os.path.splitext(self._record_path)
+        fallback_path = base + ".avi"
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        writer = cv2.VideoWriter(fallback_path, fourcc, 30.0, (w, h))
+        if writer.isOpened():
+            self._record_path = fallback_path
+            print(f"[INFO] Recording started -> {self._record_path}")
+            return writer
+
+        writer.release()
+        print(f"[ERROR] Could not open a video writer for this session — "
+              f"recording disabled, CSV logging is unaffected.")
+        self._record_failed = True
+        self._record_path   = None
+        return None
+
     # called at the end of every _process() pass,
     def _finish(self, out: np.ndarray, center, smoothed: float, now: float):
-        """Sparkline, HUD text, and CSV row — shared by both detection paths."""
+        """Sparkline, HUD text, video frame, and CSV row — shared by both detection paths.
+
+        Video frame and CSV row are written here together (same call, same
+        frame_idx) so they can never drift apart in count or time.
+        """
+        frame_idx = self._frame_idx
+        self._frame_idx += 1
+
         self._spark_hist.append(smoothed)
         draw_sparkline(out, list(self._spark_hist), self.vel_drop)
 
@@ -527,10 +613,15 @@ class CylinderVelocityNode(Node):
             with self._dist_lock:
                 self._dist_frame = dist
 
-        hud = f"State: {self._state} | Events: {self._event_count}"
+        hud = f"State: {self._state} | Events: {self._event_count} | Frame: {frame_idx}"
         cv2.rectangle(out, (4, 4), (12 + len(hud) * 11, 30), (0, 0, 0), -1)
         cv2.putText(out, hud, (8, 23),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+
+        if self._record_path is not None and self._video_writer is None and not self._record_failed:
+            self._video_writer = self._open_video_writer(out.shape[:2])
+        if self._video_writer is not None:
+            self._video_writer.write(out)
 
         if self._log_file is not None:
             cx = int(center[0]) if center is not None else -1
@@ -544,7 +635,7 @@ class CylinderVelocityNode(Node):
             else:
                 psm1_str = ",,,,,,,"
             self._log_file.write(
-                f"{now - self._start_time:.3f},{self._state},"
+                f"{frame_idx},{now - self._start_time:.3f},{self._state},"
                 f"{smoothed:.3f},{cx},{cy},{psm1_str}\n")
 
     def get_annotated_frame(self):
@@ -575,6 +666,10 @@ class CylinderVelocityNode(Node):
             self._log_file.flush()
             self._log_file.close()
             self._log_file = None
+        if self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+            print(f"[INFO] Video saved -> {self._record_path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -585,6 +680,18 @@ def main():
     rclpy.init()
     model = YOLO(args.weights)
     print(f"[INFO] Loaded weights: {args.weights}")
+
+    xgb_model = xgb_le = None
+    if args.model:
+        from xgboost import XGBClassifier
+        import joblib
+        xgb_model = XGBClassifier()
+        xgb_model.load_model(args.model)
+        le_path = args.model.replace(".json", ".labels.pkl")
+        xgb_le  = joblib.load(le_path)
+        print(f"[INFO] XGBoost model:  {args.model}  (window={args.window})")
+    else:
+        print(f"[INFO] Mode:           rule-based thresholds")
     print(f"[INFO] Topic:          {args.topic}")
     print(f"[INFO] Confidence:     {args.conf}")
     print(f"[INFO] Inference size: {args.imgsz}")
@@ -632,7 +739,9 @@ def main():
         args.topic, model, args.conf, args.imgsz,
         args.vel_stat, args.vel_drop, args.lost, args.vel_window,
         args.spike_frames, args.settle_frames, args.max_jump,
-        args.drop_timeout, args.log, settings)
+        args.drop_timeout, args.log, args.record,
+        xgb_model=xgb_model, xgb_le=xgb_le, xgb_window=args.window,
+        settings=settings)
 
     executor    = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
@@ -646,20 +755,11 @@ def main():
     cv2.namedWindow(plot_window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(plot_window, pw, ph)
 
-    video_writer = None
-
     try:
         while rclpy.ok():
             frame = node.get_annotated_frame()
             if frame is not None:
                 cv2.imshow(window, frame)
-                if args.record:
-                    if video_writer is None:
-                        h, w = frame.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        video_writer = cv2.VideoWriter(args.record, fourcc, 30.0, (w, h))
-                        print(f"[INFO] Recording started → {args.record}")
-                    video_writer.write(frame)
             if args.mode == "dist":
                 node.show_dist_plot(plot_window)
             else:
@@ -670,9 +770,6 @@ def main():
         pass
     finally:
         node.stop()
-        if video_writer is not None:
-            video_writer.release()
-            print(f"[INFO] Video saved → {args.record}")
         cv2.destroyAllWindows()
         executor.shutdown()
         try:
@@ -700,8 +797,10 @@ def parse_args():
     p.add_argument("--title",                     default=None,             help="Optional session title written as first comment in the CSV")
     p.add_argument("--max-jump",      type=float, default=800.0,            help="Max implied speed (px/s) before a detection is rejected as spurious")
     p.add_argument("--drop-timeout",  type=float, default=2.0,              help="Seconds before DROPPED auto-resets to STATIONARY if settle never triggers")
-    p.add_argument("--mode",                      default="velocity", 
+    p.add_argument("--mode",                      default="velocity",
                                         choices=["velocity", "dist"],       help="'velocity' shows time-series plot; 'dist' shows histogram of all samples")
+    p.add_argument("--model",                     default=None,             help="XGBoost model .json — replaces rule-based thresholds")
+    p.add_argument("--window",         type=int,   default=5,               help="Feature lag window (must match training default, default 5)")
     return p.parse_args()
 
 

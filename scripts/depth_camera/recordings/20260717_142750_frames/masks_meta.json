@@ -1,0 +1,128 @@
+{
+  "start_frame": 0,
+  "n_supervision": 9,
+  "annotated_frames": [
+    0,
+    10,
+    59,
+    101,
+    148,
+    255,
+    274,
+    326,
+    367,
+    382
+  ],
+  "prompts": [
+    {
+      "frame": 0,
+      "u": 279,
+      "v": 316,
+      "label": 1
+    },
+    {
+      "frame": 0,
+      "u": 282,
+      "v": 323,
+      "label": 1
+    },
+    {
+      "frame": 10,
+      "u": 281,
+      "v": 311,
+      "label": 1
+    },
+    {
+      "frame": 10,
+      "u": 281,
+      "v": 287,
+      "label": 0
+    },
+    {
+      "frame": 59,
+      "u": 335,
+      "v": 239,
+      "label": 1
+    },
+    {
+      "frame": 101,
+      "u": 352,
+      "v": 284,
+      "label": 1
+    },
+    {
+      "frame": 101,
+      "u": 344,
+      "v": 297,
+      "label": 1
+    },
+    {
+      "frame": 101,
+      "u": 352,
+      "v": 272,
+      "label": 0
+    },
+    {
+      "frame": 101,
+      "u": 344,
+      "v": 279,
+      "label": 0
+    },
+    {
+      "frame": 148,
+      "u": 266,
+      "v": 230,
+      "label": 1
+    },
+    {
+      "frame": 255,
+      "u": 268,
+      "v": 354,
+      "label": 1
+    },
+    {
+      "frame": 274,
+      "u": 283,
+      "v": 234,
+      "label": 1
+    },
+    {
+      "frame": 274,
+      "u": 279,
+      "v": 255,
+      "label": 0
+    },
+    {
+      "frame": 326,
+      "u": 213,
+      "v": 312,
+      "label": 1
+    },
+    {
+      "frame": 326,
+      "u": 239,
+      "v": 323,
+      "label": 0
+    },
+    {
+      "frame": 367,
+      "u": 337,
+      "v": 216,
+      "label": 1
+    },
+    {
+      "frame": 382,
+      "u": 359,
+      "v": 327,
+      "label": 1
+    },
+    {
+      "frame": 382,
+      "u": 362,
+      "v": 298,
+      "label": 0
+    }
+  ],
+  "num_frames_processed": 455,
+  "checkpoint": "/home/stanford/dvrk_shujiro_ws/src/dvrk_shujiro/scripts/depth_camera/checkpoints/sam2.1_hiera_large.pt"
+}

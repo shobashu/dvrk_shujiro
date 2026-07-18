@@ -134,6 +134,7 @@ def extract(bag_path: Path, out_dir: Path, target_fps: float,
         "jpeg_quality":   jpeg_quality,
         "has_depth":      save_depth,
         "intrinsics":     intr,
+        "depth_scale":    session_meta.get("depth_scale"),  # metres/unit; None for pre-fix recordings
         "session":        session_meta,
     }
     yaml_path = out_dir / "metadata.yaml"

@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 import joblib
@@ -53,30 +53,61 @@ def load_csv(path: str) -> pd.DataFrame:
     psm1_cols = [c for c in BASE_COLS if c.startswith("psm1_")]
     df = df.dropna(subset=psm1_cols)
     df = df.reset_index(drop=True)
+    df["_source"] = Path(path).name  # tags rows so windows/events never cross session boundaries
     print(f"  {path}: {len(df)} rows after cleaning")
     return df
 
 
+def summarize_events(df: pd.DataFrame) -> None:
+    """Print row counts vs. distinct contiguous-event counts per state.
+
+    Row count alone is misleading for a state machine: a rare state that only
+    ever occurs in a couple of long segments will still rack up a big row
+    count, but the model has really only seen a couple of independent
+    examples of what that state looks like.
+    """
+    seg = ((df["state"] != df["state"].shift()) |
+           (df["_source"] != df["_source"].shift())).cumsum()
+    n_events = df.groupby(seg)["state"].first().value_counts()
+    n_rows = df["state"].value_counts()
+    print(f"  {'state':<11}{'rows':>8}{'events':>8}")
+    for s in STATES:
+        print(f"  {s:<11}{n_rows.get(s, 0):>8}{n_events.get(s, 0):>8}")
+    print()
+
+
 # ── Feature engineering ───────────────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame, window: int) -> tuple[np.ndarray, np.ndarray]:
+def build_features(df: pd.DataFrame, window: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, LabelEncoder]:
     """
     For each row build a feature vector using:
       - current frame values for all BASE_COLS
       - lagged values (1..window-1 frames back) for all BASE_COLS
       - first-order deltas (current - lag1) for all BASE_COLS
 
-    Rows that don't have enough history are dropped.
-    Returns X (n_samples, n_features), y (n_samples,) as label integers.
+    Rows that don't have enough history are dropped, as are rows whose
+    window would reach back across a session ("_source") boundary.
+
+    Also assigns each row a group id — a contiguous same-state, same-session
+    "event" — so that cross-validation can hold out whole events instead of
+    individual (near-duplicate) frames. See summarize_events().
+
+    Returns X (n_samples, n_features), y (n_samples,), groups (n_samples,).
     """
     arr = df[BASE_COLS].values.astype(np.float32)
     labels = df["state"].values
+    sources = df["_source"].values
     le = LabelEncoder()
     le.fit(STATES)
     y_all = le.transform(labels)
 
-    rows_X, rows_y = [], []
+    event_id = ((df["state"] != df["state"].shift()) |
+                (df["_source"] != df["_source"].shift())).cumsum().values
+
+    rows_X, rows_y, rows_g = [], [], []
     for i in range(window - 1, len(arr)):
+        if sources[i - window + 1] != sources[i]:
+            continue  # window would straddle two different recording sessions
         window_data = arr[i - window + 1: i + 1]   # shape (window, n_base)
         # flatten: current frame first, then lag1, lag2, ...
         current = window_data[-1]
@@ -85,10 +116,12 @@ def build_features(df: pd.DataFrame, window: int) -> tuple[np.ndarray, np.ndarra
         feat    = np.concatenate([current, lags, delta])
         rows_X.append(feat)
         rows_y.append(y_all[i])
+        rows_g.append(event_id[i])
 
     X = np.array(rows_X, dtype=np.float32)
     y = np.array(rows_y, dtype=np.int32)
-    return X, y, le
+    groups = np.array(rows_g, dtype=np.int64)
+    return X, y, groups, le
 
 
 def feature_names(window: int) -> list[str]:
@@ -101,7 +134,7 @@ def feature_names(window: int) -> list[str]:
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train(X: np.ndarray, y: np.ndarray, le: LabelEncoder):
+def train(X: np.ndarray, y: np.ndarray, groups: np.ndarray, le: LabelEncoder):
     model = XGBClassifier(
         n_estimators=300,
         max_depth=6,
@@ -114,16 +147,28 @@ def train(X: np.ndarray, y: np.ndarray, le: LabelEncoder):
         n_jobs=-1,
     )
 
-    print("\n── Cross-validation (5-fold stratified) ──")
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    scores = cross_val_score(model, X, y, cv=cv, scoring="f1_macro", n_jobs=-1)
+    # cap folds at the rarest class's event count, so no fold is forced to
+    # hold out 100% of a rare class's events (still best-effort beyond that —
+    # StratifiedGroupKFold approximates stratification when groups are scarce)
+    events_per_class = [len(np.unique(groups[y == c])) for c in np.unique(y)]
+    n_groups = len(np.unique(groups))
+    n_splits = max(2, min(5, min(events_per_class)))
+
+    print(f"\n── Cross-validation ({n_splits}-fold, grouped by event) ──")
+    if n_splits < 5:
+        print(f"  [NOTE] Rarest class has only {min(events_per_class)} distinct events "
+              f"(out of {n_groups} total) — using {n_splits} folds instead of 5, "
+              f"and treat this score as a rough signal, not a precise estimate.")
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    scores = cross_val_score(model, X, y, groups=groups, cv=cv, scoring="f1_macro", n_jobs=-1)
     print(f"  F1-macro: {scores.mean():.3f} ± {scores.std():.3f}")
 
     print("\n── Training on full dataset ──")
     model.fit(X, y)
 
     y_pred = model.predict(X)
-    print("\n── Classification report (training set) ──")
+    print("\n── Classification report (training set — optimistic, not a generalization "
+          "estimate; trust the grouped CV score above instead) ──")
     print(classification_report(y, y_pred,
                                 target_names=le.classes_,
                                 zero_division=0))
@@ -164,15 +209,15 @@ def main():
     print("── Loading CSV files ──")
     frames = [load_csv(p) for p in args.csvs]
     df = pd.concat(frames, ignore_index=True)
-    print(f"  Total rows: {len(df)}")
-    print(f"  State distribution:\n{df['state'].value_counts().to_string()}\n")
+    print(f"  Total rows: {len(df)}\n")
+    summarize_events(df)
 
     print("── Building features ──")
-    X, y, le = build_features(df, args.window)
+    X, y, groups, le = build_features(df, args.window)
     names = feature_names(args.window)
     print(f"  X shape: {X.shape}  (samples × features)")
 
-    model = train(X, y, le)
+    model = train(X, y, groups, le)
     print_importances(model, names)
 
     out_path = Path(args.out)

@@ -42,20 +42,34 @@ import yaml
 MIN_VALID_PX  = 10      # skip frame if fewer valid depth pixels than this
 MAX_DEPTH_MM  = 5000    # ignore depth readings beyond 5 m (also catches uint16 sentinel 65535)
 
+# D405 short-range sensors commonly report 0.0001 m/unit (10x finer than the
+# 0.001 m/unit "standard" scale most other RealSense depth cameras use).
+# Only used as a fallback for recordings made before depth_scale was captured
+# in the metadata (04_record_session.py) — new recordings carry the real,
+# sensor-reported value instead of this guess.
+FALLBACK_DEPTH_SCALE = 0.0001
+
 
 def load_intrinsics(meta_path: Path) -> dict:
     meta = yaml.safe_load(meta_path.read_text())
     intr = meta["intrinsics"]
+    depth_scale = meta.get("depth_scale")
+    if depth_scale is None:
+        depth_scale = FALLBACK_DEPTH_SCALE
+        print(f"[warn] no depth_scale in {meta_path.name} (recorded before this was tracked) — "
+              f"assuming D405 default {FALLBACK_DEPTH_SCALE} m/unit. "
+              f"Verify against pegs.json if this recording used a different sensor.")
     return {
         "fx":  float(intr["fx"]),
         "fy":  float(intr["fy"]),
         "ppx": float(intr["ppx"]),
         "ppy": float(intr["ppy"]),
         "target_fps": float(meta["target_fps"]),
+        "depth_scale": float(depth_scale),
     }
 
 
-def deproject(mask: np.ndarray, depth_mm: np.ndarray, fx, fy, ppx, ppy):
+def deproject(mask: np.ndarray, depth_raw: np.ndarray, fx, fy, ppx, ppy, depth_scale: float):
     """
     Return (centroid_xyz_m, n_valid) where centroid_xyz_m is shape (3,)
     or None if not enough valid pixels.
@@ -64,14 +78,14 @@ def deproject(mask: np.ndarray, depth_mm: np.ndarray, fx, fy, ppx, ppy):
     if len(xs) == 0:
         return None, 0
 
-    depths = depth_mm[ys, xs].astype(np.float64)
-    valid  = (depths > 0) & (depths < MAX_DEPTH_MM)
-    n_valid = int(valid.sum())
+    depths_m = depth_raw[ys, xs].astype(np.float64) * depth_scale
+    valid    = (depths_m > 0) & (depths_m < MAX_DEPTH_MM / 1000.0)
+    n_valid  = int(valid.sum())
 
     if n_valid < MIN_VALID_PX:
         return None, n_valid
 
-    d_m = depths[valid] / 1000.0
+    d_m = depths_m[valid]
     X   = (xs[valid] - ppx) * d_m / fx
     Y   = (ys[valid] - ppy) * d_m / fy
     Z   = d_m
@@ -145,7 +159,8 @@ def main():
     # ── load config ───────────────────────────────────────────────────────────
     intr = load_intrinsics(meta_path)
     fx, fy, ppx, ppy = intr["fx"], intr["fy"], intr["ppx"], intr["ppy"]
-    target_fps = intr["target_fps"]
+    target_fps  = intr["target_fps"]
+    depth_scale = intr["depth_scale"]
 
     import json
     pegs_data = json.loads(pegs_path.read_text())
@@ -160,6 +175,7 @@ def main():
     print(f"Masks      : {len(mask_files)}  from {masks_dir.name}/")
     print(f"Depth      : {depth_dir.name}/")
     print(f"Intrinsics : fx={fx:.1f}  fy={fy:.1f}  pp=({ppx:.1f},{ppy:.1f})")
+    print(f"Depth scale: {depth_scale} m/unit")
     print(f"Pegs       : {len(pegs_list)} registered")
     print(f"Up axis    : {up.round(3).tolist()}")
     print(f"Output     : {out_path}")
@@ -179,15 +195,15 @@ def main():
             n_skipped += 1
             continue
 
-        mask     = cv2.imread(str(mask_path),  cv2.IMREAD_GRAYSCALE)
-        depth_mm = cv2.imread(str(depth_path), cv2.IMREAD_ANYDEPTH)
+        mask      = cv2.imread(str(mask_path),  cv2.IMREAD_GRAYSCALE)
+        depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_ANYDEPTH)
 
-        if mask is None or depth_mm is None:
+        if mask is None or depth_raw is None:
             print(f"[warn] could not read frame {mask_path.stem} — skipping")
             n_skipped += 1
             continue
 
-        centroid, n_valid = deproject(mask, depth_mm, fx, fy, ppx, ppy)
+        centroid, n_valid = deproject(mask, depth_raw, fx, fy, ppx, ppy, depth_scale)
 
         if centroid is None:
             rows.append({

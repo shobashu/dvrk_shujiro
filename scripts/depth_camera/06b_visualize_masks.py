@@ -14,6 +14,10 @@ Run:
     python3 scripts/depth_camera/06b_visualize_masks.py \\
         --frames recordings/trial_001_20260630_105549_frames/images/ \\
         --masks  recordings/trial_001_20260630_105549_frames/masks/
+
+    python3 06b_visualize_masks.py \
+    --frames recordings/trial_001_20260630_105549_frames/images/ \
+    --masks masks/
 """
 
 import argparse

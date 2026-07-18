@@ -46,6 +46,7 @@ data/
 *.csv
 *.pt
 *.mp4
+*.avi
 
 # ROS bag recordings (can be several GB each)
 *.db3

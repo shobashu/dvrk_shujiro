@@ -16,9 +16,9 @@ Phases per trial:
   Transport    = Lift_Time → Place_Time  (lifting → placing peg)
 
 Usage:
-    python3 plots_mk/plot_tg14_corr.py --subject fc12
-    python3 plots_mk/plot_tg14_corr.py --subject tg14 --out tg14_corr.png
-    python3 plots_mk/plot_tg14_corr.py --psm1 /path/to/X_PSM1.csv --arduino /path/to/data_X.csv
+    python3 plots_mk/plot_corr.py --subject fc12
+    python3 plots_mk/plot_corr.py --subject tg14 --out tg14_corr.png
+    python3 plots_mk/plot_corr.py --psm1 /path/to/X_PSM1.csv --arduino /path/to/data_X.csv
 """
 
 import argparse
@@ -243,8 +243,7 @@ def main():
     subject   = args.subject or os.path.basename(args.psm1).replace("_PSM1.csv", "")
     psm1_csv  = args.psm1    or os.path.join(PSM1_DIR,    f"{subject}_PSM1.csv")
     ard_csv   = args.arduino or os.path.join(ARDUINO_DIR, f"experiment_data_{subject}.csv")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    out        = args.out or (os.path.join(script_dir, f"{subject}_corr.png") if args.subject else None)
+    out       = args.out     or (f"{subject}_corr.png" if args.subject else None)
 
     for path, label in [(psm1_csv, "PSM1"), (ard_csv, "Arduino")]:
         if not os.path.exists(path):
