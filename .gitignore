@@ -51,6 +51,9 @@ data/
 # ROS bag recordings (can be several GB each)
 *.db3
 
-# Depth camera masks
+# Depth camera masks and per-session metadata (recordings/ only — pegs.json,
+# camera_settings.json etc. directly under depth_camera/ stay tracked)
 scripts/depth_camera/masks/*.png
 scripts/depth_camera/recordings/**/*.png
+scripts/depth_camera/recordings/**/*.json
+scripts/depth_camera/recordings/**/*.yaml

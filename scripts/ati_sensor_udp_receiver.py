@@ -31,7 +31,7 @@ class AtiSensorUdpReceiver(Node):
     def __init__(self):
         super().__init__("ati_sensor_udp_receiver")
 
-        self.declare_parameter("udp_ip",   "0.0.0.0")
+        self.declare_parameter("udp_ip",   "10.136.92.177")
         self.declare_parameter("udp_port", 5006)
         self.declare_parameter("frame_id", "ati_sensor")
 

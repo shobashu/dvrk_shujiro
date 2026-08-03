@@ -24,6 +24,7 @@ import sys
 import os
 import time
 import csv
+import json
 import select
 import threading
 import signal
@@ -57,6 +58,24 @@ ARDUINO_PORT = '/dev/ttyACM0'
 BAUD_RATE    = 9600
 CSV_FILENAME = 'experiment_data.csv'
 WRENCH_TOPIC = '/ati_sensor/wrench'
+
+# Cross-process signal for scripts/depth_camera/09_live_trial_monitor.py.
+# That script needs pyrealsense2/sam2 (dvrk_ml conda env) which can't coexist
+# in this process with rclpy (ros2_yolo_venv) — dvrk_ml's rclpy is broken at
+# the C-extension level, and ros2_yolo_venv has neither pyrealsense2 nor
+# sam2. Rather than merge environments, this process just appends one JSON
+# line per trial boundary to a small file; the depth-side script tails it.
+# Truncated fresh on every run of THIS script, so a restarted depth monitor
+# only reacts to trials from this point forward, not stale ones.
+#
+# Schema (one JSON object per line):
+#   {"event": "trial_start", "trial": "3", "center_peg": 2, "t": 1234567.89}
+#   {"event": "trial_end",   "trial": "3", "t": 1234571.23}
+# center_peg (1-4) identifies which of the 4 center-peg cylinders is active
+# this trial — the depth side uses it to pick which of its 4 per-cylinder
+# --reuse-prompts templates to replay, since a single template can't safely
+# track whichever cylinder happens to be moving when 4 are on the board.
+TRIAL_SIGNAL_PATH = '/tmp/dvrk_depth_trial_signal.jsonl'
 
 CAMERA_TOPIC              = '/camera_left/compressed'
 YOLO_WEIGHTS              = os.path.join(_SCRIPTS_DIR, 'models', 'best_v2.pt')
@@ -180,6 +199,14 @@ def arduino_loop(popup, wrench_listener, camera_node, model):
         arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
         time.sleep(2)  # Give Arduino time to reset
 
+        signal_file = open(TRIAL_SIGNAL_PATH, 'w')   # fresh each run — see comment above
+
+        def emit_signal(event, trial, **extra):
+            payload = {"event": event, "trial": trial, "t": time.time()}
+            payload.update(extra)
+            signal_file.write(json.dumps(payload) + "\n")
+            signal_file.flush()
+
         with open(CSV_FILENAME, mode='a', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(['Trial', 'Target_Peg', 'Target_Color',
@@ -254,7 +281,12 @@ def arduino_loop(popup, wrench_listener, camera_node, model):
                         python_sync_time    = time.time()
 
                     elif line.startswith("--- Trial"):
-                        # e.g. "--- Trial 3 ---" — marks the start of a new trial
+                        # e.g. "--- Trial 3 ---" — marks the start of a new trial.
+                        # Force capture starts here as before; the depth-camera
+                        # trial_start signal is emitted one line later (below),
+                        # once we also know which of the 4 center-peg cylinders
+                        # is active this trial — the depth side needs that to
+                        # pick the matching --reuse-prompts template.
                         digits = ''.join(ch for ch in line if ch.isdigit())
                         current_trial = digits or current_trial
                         wrench_listener.start_trial()
@@ -262,6 +294,17 @@ def arduino_loop(popup, wrench_listener, camera_node, model):
                         last_lifted_peg = None
                         pending_orientation = None
                         current_target_color = None
+
+                    elif "Waiting for lift from Center Peg" in line:
+                        # e.g. "Waiting for lift from Center Peg 2" — identifies
+                        # which of the 4 cylinders is active this trial, printed
+                        # right after "--- Trial N ---" and before any motion.
+                        print(f"[ARDUINO] {line}")
+                        try:
+                            center_peg = int(line.split("Waiting for lift from Center Peg")[-1].strip())
+                        except ValueError:
+                            center_peg = None
+                        emit_signal("trial_start", current_trial, center_peg=center_peg)
 
                     elif line.startswith("CUE,"):
                         # e.g. "CUE,Blue" — sent as soon as the target LEDs light up,
@@ -296,6 +339,7 @@ def arduino_loop(popup, wrench_listener, camera_node, model):
                     elif line == "Object returned successfully.":
                         # Trial is fully complete — snapshot the force applied during it
                         print(f"[ARDUINO] {line}")
+                        emit_signal("trial_end", current_trial)
                         last_force_result = wrench_listener.end_trial()
                         times, forces, peak, mean = last_force_result
                         angle_deg, is_upright, down_color, success = last_orientation

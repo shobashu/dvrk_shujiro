@@ -76,17 +76,30 @@ def collect_frame_files(frames_dir: Path) -> list:
 
 def annotate_frame(predictor, state, frame_bgr: np.ndarray,
                    frame_idx: int, hud: str | None,
-                   initial: bool = False) -> list | None:
+                   initial: bool = False, initial_clicks: list | None = None) -> list | None:
     """
     Interactive annotation loop for one frame.
     Returns list of (u, v, label) tuples if confirmed, or None if skipped.
     If initial=True the user must confirm with 'p' (no skip option).
+    If initial_clicks is given (reused from a prior session), the predictor
+    is seeded with them up front so the mask preview is already visible —
+    press Enter/p to accept as-is, or click/reset to correct.
     """
     H, W  = frame_bgr.shape[:2]
-    clicks: list = []
+    clicks: list = list(initial_clicks) if initial_clicks else []
     mask         = None
     mode: int    = 1
     cb           = {"click": None}
+
+    if clicks:
+        pts = np.array([[c[0], c[1]] for c in clicks], dtype=np.float32)
+        lbs = np.array([c[2]         for c in clicks], dtype=np.int32)
+        _, _, masks = predictor.add_new_points_or_box(
+            state, frame_idx=frame_idx, obj_id=1,
+            points=pts, labels=lbs, clear_old_points=True)
+        mask = (masks[0, 0] > 0).cpu().numpy().astype(np.uint8)
+        print(f"    [reused] {len(clicks)} click(s) replayed → {int(mask.sum())} px masked  "
+              f"— Enter/p to accept, or click/r to correct")
 
     def on_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -156,7 +169,35 @@ def main():
                     help="Number of additional supervision frames (default: 9)")
     ap.add_argument("--seed",          type=int, default=None,
                     help="Random seed for frame selection (optional)")
+    ap.add_argument("--reuse-prompts", default=None, dest="reuse_prompts",
+                    help="Path to a previous session's masks_meta.json — replay its confirmed "
+                         "click coordinates on this video's matching frame indices instead of "
+                         "clicking from scratch. Only reliable if the camera pose and the "
+                         "cylinder/gripper's starting position haven't shifted since that "
+                         "session — you'll still see each replayed mask and can correct it.")
+    ap.add_argument("--extra-supervision", type=int, default=0, dest="extra_supervision",
+                    help="Additional freshly-random supervision frames on top of the reused "
+                         "ones, to catch drift specific to this new video (default: 0)")
+    ap.add_argument("--auto", action="store_true",
+                    help="Headless mode: skip all GUI confirmation entirely and directly "
+                         "propagate the reused prompts with no human check on any frame. "
+                         "Requires --reuse-prompts. For unattended/batch runs only — a bad "
+                         "replay on any frame will silently produce a wrong mask.")
+    ap.add_argument("--force-frames", default=None, dest="force_frames",
+                    help="Comma-separated frame indices to force-include as supervision, "
+                         "on top of --n-supervision/--extra-supervision's random picks. Use "
+                         "this to target a known problem region — e.g. if you saw drift/wrong "
+                         "detections starting around frame 140, pass --force-frames 130,145,160.")
     args = ap.parse_args()
+
+    if args.auto and not args.reuse_prompts:
+        sys.exit("[error] --auto requires --reuse-prompts (nothing to replay headlessly).")
+    if args.auto and args.extra_supervision:
+        print("[warn] --extra-supervision ignored in --auto mode (no human to click new frames).")
+        args.extra_supervision = 0
+    if args.auto and args.force_frames:
+        print("[warn] --force-frames ignored in --auto mode (no human to click new frames).")
+        args.force_frames = None
 
     frames_dir = Path(args.frames).resolve()
     out_dir    = Path(args.output).resolve()
@@ -174,6 +215,43 @@ def main():
     if start_frame >= num_frames:
         sys.exit(f"[error] --start-frame {start_frame} >= number of frames ({num_frames})")
 
+    force_frames: list[int] = []
+    if args.force_frames:
+        try:
+            force_frames = [int(x.strip()) for x in args.force_frames.split(",") if x.strip()]
+        except ValueError:
+            sys.exit(f"[error] --force-frames must be comma-separated integers, got: "
+                     f"{args.force_frames!r}")
+        bad = [f for f in force_frames if f < 0 or f >= num_frames]
+        if bad:
+            sys.exit(f"[error] --force-frames out of range for this {num_frames}-frame video: {bad}")
+
+    # ── load reused prompts, if any ────────────────────────────────────────────
+    reused_clicks: dict[int, list] = {}
+    if args.reuse_prompts:
+        reuse_path = Path(args.reuse_prompts).resolve()
+        if not reuse_path.exists():
+            sys.exit(f"[error] --reuse-prompts file not found: {reuse_path}")
+        reused_meta = json.loads(reuse_path.read_text())
+        for p in reused_meta["prompts"]:
+            reused_clicks.setdefault(p["frame"], []).append((p["u"], p["v"], p["label"]))
+
+        # A template built from a longer clip can have annotated frames past
+        # the end of a shorter video (e.g. a short real trial vs. a long
+        # sweep-all-pegs template) — drop just those, keep whatever fits,
+        # rather than refusing the whole trial over one out-of-range frame.
+        out_of_range = [f for f in reused_clicks if f >= num_frames]
+        if out_of_range:
+            print(f"[warn] template has {len(out_of_range)} annotated frame(s) past the end "
+                  f"of this {num_frames}-frame video (max {max(out_of_range)}) — dropping those, "
+                  f"keeping the rest.")
+            for f in out_of_range:
+                del reused_clicks[f]
+        if not reused_clicks:
+            sys.exit(f"[error] none of this template's annotated frames fit within "
+                     f"{num_frames} frames — nothing usable to replay.")
+        print(f"Reusing {len(reused_clicks)} annotated frame(s) from {reuse_path.name}")
+
     # ── build predictor ────────────────────────────────────────────────────────
     print(f"Loading SAM2  : {ckpt_path.name}")
     predictor = build_sam2_video_predictor(args.config, str(ckpt_path), device="cuda")
@@ -186,45 +264,73 @@ def main():
     )
 
     # ── pick supervision frames ────────────────────────────────────────────────
-    candidates = [i for i in range(num_frames) if i != start_frame]
-    n_sup      = min(args.n_supervision, len(candidates))
-    rng        = np.random.default_rng(args.seed)
-    sup_frames = sorted(rng.choice(candidates, n_sup, replace=False).tolist()) if n_sup > 0 else []
+    if reused_clicks:
+        # replay the exact frames annotated last time; start_frame follows suit
+        reused_frames = sorted(reused_clicks)
+        start_frame   = reused_frames[0]
+        sup_frames    = reused_frames[1:]
 
+        candidates = [i for i in range(num_frames) if i not in reused_clicks]
+        n_extra    = min(args.extra_supervision, len(candidates))
+        rng        = np.random.default_rng(args.seed)
+        extra_frames = (sorted(rng.choice(candidates, n_extra, replace=False).tolist())
+                        if n_extra > 0 else [])
+        sup_frames   = sorted(sup_frames + extra_frames)
+    else:
+        candidates = [i for i in range(num_frames) if i != start_frame]
+        n_sup      = min(args.n_supervision, len(candidates))
+        rng        = np.random.default_rng(args.seed)
+        sup_frames = sorted(rng.choice(candidates, n_sup, replace=False).tolist()) if n_sup > 0 else []
+        extra_frames = []
+
+    if force_frames:
+        new_forced = [f for f in force_frames if f != start_frame and f not in sup_frames]
+        if new_forced:
+            print(f"Force-including {len(new_forced)} frame(s): {sorted(new_forced)}")
+        sup_frames = sorted(sup_frames + new_forced)
+
+    n_sup      = len(sup_frames)
     all_frames = [start_frame] + sup_frames   # annotation order
     print(f"Frames to annotate ({len(all_frames)} total): {all_frames}")
     print()
 
     # ── annotation loop ────────────────────────────────────────────────────────
     # confirmed_annotations: {frame_idx: [(u, v, label), ...]}
-    confirmed: dict[int, list] = {}
+    if args.auto:
+        # No GUI, no human check — trust the replayed prompts entirely.
+        confirmed: dict[int, list] = dict(reused_clicks)
+        print(f"[auto] Replaying {len(confirmed)} frame(s) with zero confirmation.\n")
+    else:
+        confirmed = {}
+        for i, frame_idx in enumerate(all_frames):
+            bgr = cv2.imread(str(frame_files[frame_idx]))
+            if bgr is None:
+                print(f"[warn] could not read frame {frame_idx} — skipping")
+                continue
 
-    for i, frame_idx in enumerate(all_frames):
-        bgr = cv2.imread(str(frame_files[frame_idx]))
-        if bgr is None:
-            print(f"[warn] could not read frame {frame_idx} — skipping")
-            continue
+            is_initial     = (frame_idx == start_frame)
+            initial_clicks = reused_clicks.get(frame_idx)
+            reused_tag     = " [reused]" if initial_clicks else " [new]" if reused_clicks else ""
 
-        is_initial = (frame_idx == start_frame)
-        if is_initial:
-            print(f"=== Initial frame {frame_idx:05d}  (p=confirm) ===")
-            hud = None  # no extra HUD line on initial frame
-        else:
-            sup_i = sup_frames.index(frame_idx)
-            print(f"=== Supervision {sup_i + 1}/{n_sup}  frame {frame_idx:05d} ===")
-            hud = (f"Supervision {sup_i + 1}/{n_sup}   "
-                   f"frame {frame_idx:05d}   "
-                   f"a=pos  n=neg")
+            if is_initial:
+                print(f"=== Initial frame {frame_idx:05d}{reused_tag}  (p=confirm) ===")
+                hud = None  # no extra HUD line on initial frame
+            else:
+                sup_i = sup_frames.index(frame_idx)
+                print(f"=== Supervision {sup_i + 1}/{n_sup}  frame {frame_idx:05d}{reused_tag} ===")
+                hud = (f"Supervision {sup_i + 1}/{n_sup}   "
+                       f"frame {frame_idx:05d}{reused_tag}   "
+                       f"a=pos  n=neg")
 
-        result = annotate_frame(predictor, state, bgr, frame_idx,
-                                hud=hud, initial=is_initial)
+            result = annotate_frame(predictor, state, bgr, frame_idx,
+                                    hud=hud, initial=is_initial, initial_clicks=initial_clicks)
 
-        if result is not None:
-            confirmed[frame_idx] = result
-            print(f"  Confirmed: {len(result)} click(s)")
-        # else: skipped — will be excluded from final state
+            if result is not None:
+                confirmed[frame_idx] = result
+                print(f"  Confirmed: {len(result)} click(s)")
+            # else: skipped — will be excluded from final state
 
-    cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
     if not confirmed:
         sys.exit("[error] no frames confirmed — nothing to propagate.")

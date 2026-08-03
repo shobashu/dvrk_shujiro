@@ -74,7 +74,20 @@ PEG_PALETTE = [
     (255, 220,   0),
     (180,   0, 255),
     (0,   220, 180),
+    (128, 255,   0),
+    (255,   0, 128),
+    (0,   128, 255),
+    (255, 255,   0),
 ]
+
+# Board layout: 3 columns x 4 rows.  Click order matters — it fixes peg IDs,
+# which build_board_frame() (07b/07c) uses to derive the board's X axis
+# (peg0 -> peg4).  Register the 8 SIDE pegs first (outer column A rows 0-3,
+# then outer column C rows 0-3), so peg0/peg4 land on opposite outer columns
+# at the same row and still span a valid X axis.  Then the 4 CENTER pegs
+# (middle column, rows 0-3) last.
+N_SIDE_PEGS   = 8
+N_CENTER_PEGS = 4
 
 PHASE_CALIBRATE = "calibrate"
 PHASE_REGISTER  = "register"
@@ -217,7 +230,9 @@ def on_mouse(event, u, v, flags, param):
             up = compute_up_axis(*[p["xyz"] for p in state["calib_pts"]])
             state["up_axis"] = up
             print(f"  Up axis (camera frame): [{up[0]:+.3f}, {up[1]:+.3f}, {up[2]:+.3f}]")
-            print("  Calibration done — advancing to peg registration.\n")
+            print("  Calibration done — advancing to peg registration.")
+            print(f"  Register the {N_SIDE_PEGS} SIDE pegs first (outer columns), "
+                  f"then the {N_CENTER_PEGS} CENTER pegs (middle column).\n")
             state["phase"] = PHASE_REGISTER
 
     elif state["phase"] == PHASE_REGISTER:
@@ -257,14 +272,35 @@ def draw_calibrate_hud(frame):
     draw_calib_markers(frame)
 
 
+def registration_group(n: int):
+    """Which peg group the next click (peg id == n) belongs to, and progress within it."""
+    if n < N_SIDE_PEGS:
+        return "SIDE",   n + 1,               N_SIDE_PEGS
+    elif n < N_SIDE_PEGS + N_CENTER_PEGS:
+        return "CENTER", n - N_SIDE_PEGS + 1,  N_CENTER_PEGS
+    else:
+        return "DONE",   0,                   0
+
+
 def draw_register_hud(frame):
     n = len(state["pegs"])
     w = frame.shape[1]
-    cv2.rectangle(frame, (0, 0), (w, 26), (20, 30, 20), -1)
+    group, idx, total = registration_group(n)
+    cv2.rectangle(frame, (0, 0), (w, 48), (20, 30, 20), -1)
     cv2.putText(frame,
                 f"REGISTER  |  {n} peg(s)  |  "
                 "left-click=add  u=undo  r=reset  Enter=review map  q=quit",
                 (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA)
+    if group == "DONE":
+        line2 = "All 12 pegs registered — press Enter to review."
+        color2 = (0, 255, 128)
+    elif group == "SIDE":
+        line2 = f"--> Click SIDE peg {idx}/{total}  (outer columns)   [then 4 CENTER pegs]"
+        color2 = (0, 220, 255)
+    else:
+        line2 = f"--> Click CENTER peg {idx}/{total}  (middle column)"
+        color2 = (255, 180, 0)
+    cv2.putText(frame, line2, (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color2, 1, cv2.LINE_AA)
     draw_peg_markers(frame)
 
 
@@ -442,6 +478,8 @@ def main():
                     print("  Calibration skipped — using default −Y axis.\n")
                     state["phase"] = PHASE_REGISTER
                     print("--- PHASE 2: REGISTER ---")
+                    print(f"Register the {N_SIDE_PEGS} SIDE pegs first (outer columns), "
+                          f"then the {N_CENTER_PEGS} CENTER pegs (middle column).")
                     print("Left-click each peg top.  Enter = review 3-D map.\n")
 
             # ── REGISTER phase ────────────────────────────────────────────────
@@ -451,29 +489,43 @@ def main():
                     u, v = state["pending_click"]
                     state["pending_click"] = None
                     peg_id = len(state["pegs"])
-                    print(f"  Registering peg {peg_id} at ({u}, {v})…", end="", flush=True)
-                    xyz, n = capture_peg_xyz(u, v)
-                    if xyz is not None:
-                        X, Y, Z = xyz
-                        print(f"  X={X:+.4f}  Y={Y:+.4f}  Z={Z:.4f} m  "
-                              f"[{n}/{CAPTURE_FRAMES * 49} samples]")
-                        color_bgr = PEG_PALETTE[peg_id % len(PEG_PALETTE)]
-                        state["pegs"].append({
-                            "id":        peg_id,
-                            "u":         u,
-                            "v":         v,
-                            "xyz_m":     xyz,
-                            "n_samples": n,
-                            "color_bgr": color_bgr,
-                        })
-                        if len(state["pegs"]) > 1:
-                            print("  Height vs previous pegs:")
-                            for prev in state["pegs"][:-1]:
-                                dh = height_diff(prev["xyz_m"], xyz)
-                                print(f"    peg {peg_id} − peg {prev['id']}: "
-                                      f"Δh = {dh*1000:+.1f} mm")
+                    total_expected = N_SIDE_PEGS + N_CENTER_PEGS
+                    if peg_id >= total_expected:
+                        print(f"  [!] All {total_expected} pegs already registered — "
+                              f"'u' to undo a peg, or Enter to review.")
                     else:
-                        print()
+                        group, idx, group_total = registration_group(peg_id)
+                        print(f"  Registering {group} peg {idx}/{group_total} "
+                              f"(id={peg_id}) at ({u}, {v})…", end="", flush=True)
+                        xyz, n = capture_peg_xyz(u, v)
+                        if xyz is not None:
+                            X, Y, Z = xyz
+                            print(f"  X={X:+.4f}  Y={Y:+.4f}  Z={Z:.4f} m  "
+                                  f"[{n}/{CAPTURE_FRAMES * 49} samples]")
+                            color_bgr = PEG_PALETTE[peg_id % len(PEG_PALETTE)]
+                            state["pegs"].append({
+                                "id":        peg_id,
+                                "u":         u,
+                                "v":         v,
+                                "xyz_m":     xyz,
+                                "n_samples": n,
+                                "color_bgr": color_bgr,
+                            })
+                            if len(state["pegs"]) > 1:
+                                print("  Height vs previous pegs:")
+                                for prev in state["pegs"][:-1]:
+                                    dh = height_diff(prev["xyz_m"], xyz)
+                                    print(f"    peg {peg_id} − peg {prev['id']}: "
+                                          f"Δh = {dh*1000:+.1f} mm")
+                            if len(state["pegs"]) == N_SIDE_PEGS:
+                                print(f"\n  ── {N_SIDE_PEGS}/{N_SIDE_PEGS} SIDE pegs done. "
+                                      f"Now register the {N_CENTER_PEGS} CENTER pegs "
+                                      f"(middle column). ──\n")
+                            elif len(state["pegs"]) == total_expected:
+                                print(f"\n  ── All {total_expected} pegs registered. "
+                                      f"Press Enter to review the 3-D map. ──\n")
+                        else:
+                            print()
 
                 draw_register_hud(frame)
                 cv2.imshow("register", frame)
