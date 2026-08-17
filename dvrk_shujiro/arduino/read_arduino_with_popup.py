@@ -16,10 +16,16 @@ BAUD_RATE    = 9600
 CSV_FILENAME = 'experiment_data.csv'
 
 
-def arduino_loop(popup):
+def arduino_loop(popup, end_mode):
     """
     Runs in a background thread.
     with popup.show_threadsafe() and popup.complete_threadsafe() added.
+
+    end_mode : "target_placed"    -> trial ends as soon as the cylinder is
+                                      placed on the outer/target peg.
+               "return_to_center" -> trial ends only once the cylinder is
+                                      placed AND carried back to the center
+                                      peg (the original behavior).
     """
     try:
         print(f"Connecting to {ARDUINO_PORT}...")
@@ -74,6 +80,12 @@ def arduino_loop(popup):
                         print("[ARDUINO] Cylinder lifted!")
                         popup.show_threadsafe()
 
+                    # Cylinder placed on the outer/target peg
+                    elif "Target hit" in line:
+                        print("[ARDUINO] Cylinder placed on target peg!")
+                        if end_mode == "target_placed":
+                            popup.complete_threadsafe()
+
                     # If Arduino sends DATA, do the math and write to CSV
                     elif line.startswith("DATA,"):
                         parts      = line.split(",")
@@ -93,7 +105,8 @@ def arduino_loop(popup):
                                          f"{place_unix:.3f}"])
                         file.flush()
                         print(f"[CSV LOGGED] Trial {trial} data saved.")
-                        popup.complete_threadsafe()
+                        if end_mode == "return_to_center":
+                            popup.complete_threadsafe()
 
                     else:
                         print(f"[ARDUINO] {line}")
@@ -104,7 +117,21 @@ def arduino_loop(popup):
         print(f"[Arduino thread error] {e}")
 
 
+def prompt_end_mode():
+    """Ask once at startup when a trial should count as ended."""
+    print("\nWhen should a trial end?")
+    print("  1) Cylinder placed on the target (outer) peg            [default]")
+    print("  2) Cylinder placed on target AND carried back to center")
+    choice = input("Choose 1 or 2 [1]: ").strip()
+    end_mode = "return_to_center" if choice == "2" else "target_placed"
+    print(f"-> Trials will end on: "
+          f"{'placement + return to center' if end_mode == 'return_to_center' else 'placement on target peg'}\n")
+    return end_mode
+
+
 def main():
+    end_mode = prompt_end_mode()
+
     # ── Setup tkinter root (hidden) and popup ─────────────────────────────────
     root = tk.Tk()
     root.withdraw()
@@ -125,7 +152,7 @@ def main():
     # ── Start Arduino loop in background thread ───────────────────────────────
     thread = threading.Thread(
         target=arduino_loop,
-        args=(popup,),
+        args=(popup, end_mode),
         daemon=True
     )
     thread.start()

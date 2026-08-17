@@ -154,7 +154,8 @@ class TimerGUI:
         self.max_time = max_time
         self.elapsed = 0.0
         self.is_running = False
-        
+        self.on_timeout = None  # callback invoked (on the Tk main thread) when elapsed >= max_time
+
         # Metrics (will be updated by node)
         self.path_length_psm1 = 0.0
         self.path_length_psm2 = 0.0
@@ -174,6 +175,19 @@ class TimerGUI:
         self._update_display()
     
     def _update_display(self):
+        if self.is_running and self.elapsed >= self.max_time:
+            # Time's up: this thread (Tk main thread, via root.after) is the
+            # only one allowed to touch the widgets, so timeout handling
+            # happens here rather than from tick() (called from the ROS
+            # spin thread). on_timeout logs the failure and resets metrics
+            # (mirrors a normal trial end) so the windows stay open and go
+            # back to "Waiting..." for the next trial.
+            self.stop()
+            if self.on_timeout:
+                self.on_timeout()
+            self.window_left.root.after(100, self._update_display)
+            return
+
         if self.is_running:
             # Format time
             minutes = int(self.elapsed // 60)

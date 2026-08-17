@@ -40,9 +40,14 @@ PyQt5>=5.15.0
 # torchvision>=0.15.0
 
 # ============================================
-# YOLO Integration (Future - Phase 3)
+# YOLO Integration
+# Used by detect_node.py, and optionally by
+# dvrk_shujiro.main's ENABLE_FORCE_SENSOR option
+# (cylinder-orientation check) — that option needs
+# this installed in the ~/ros2_yolo_venv venv, not
+# necessarily the main ROS2 environment.
 # ============================================
-# ultralytics>=8.0.0
+ultralytics>=8.0.0
 
 # ============================================
 # DeepLabCut (Future - Phase 3)
@@ -54,6 +59,7 @@ PyQt5>=5.15.0
 # ============================================
 tqdm>=4.65.0
 pyyaml>=6.0
+pyserial>=3.5   # Arduino trial trigger (dvrk_shujiro/arduino/)
 
 # ============================================
 # Development Tools (Optional)

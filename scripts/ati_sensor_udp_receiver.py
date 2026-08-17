@@ -8,6 +8,12 @@ Listens for 28-byte UDP packets from the ATI sensor sender:
 Publishes to /ati_sensor/wrench (geometry_msgs/WrenchStamped) and logs
 every sample to a timestamped CSV file.
 
+Binds to udp_ip:udp_port to listen (default 0.0.0.0 = all local interfaces,
+regardless of which IP this machine's DHCP lease currently has). This is the
+address THIS machine listens on, not the ATI sender's address — if no
+packets arrive, check the sender is actually configured to target this
+machine's current IP (`ip -4 addr show`), not binding here.
+
 Usage:
     python3 ati_sensor_udp_receiver.py
     python3 ati_sensor_udp_receiver.py --ros-args -p udp_port:=5006
@@ -31,7 +37,7 @@ class AtiSensorUdpReceiver(Node):
     def __init__(self):
         super().__init__("ati_sensor_udp_receiver")
 
-        self.declare_parameter("udp_ip",   "10.136.92.177")
+        self.declare_parameter("udp_ip",   "10.136.92.178")
         self.declare_parameter("udp_port", 5006)
         self.declare_parameter("frame_id", "ati_sensor")
 

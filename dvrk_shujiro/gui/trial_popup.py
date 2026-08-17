@@ -29,6 +29,8 @@ UPDATE_MS       = 33        # refresh rate (30fps = 33ms, 20fps = 50ms)
 FORCE_POPUP_WIDTH  = 360
 FORCE_POPUP_HEIGHT = 290
 FORCE_POPUP_SHOW_MS = 4000  # longer than the plain popup — there's a graph to read
+FORCE_PLOT_YMIN = 0         # fixed graph y-axis range (Newtons), rather than autoscale
+FORCE_PLOT_YMAX = 10
 
 # Time thresholds for bar color (seconds) — matches your existing timer logic
 THRESHOLD_ORANGE = MAX_TIME_SEC * 0.70   # 70% → orange  (same as PROGRESS_YELLOW_THRESHOLD)
@@ -61,13 +63,33 @@ class TrialPopup:
     Use show_threadsafe() and complete_threadsafe() from any thread.
     """
 
-    def __init__(self, root):
+    def __init__(self, root, force_threshold=5.0,
+                 force_popup_show_ms=None, force_popup_margin_x=None, force_popup_margin_y=None):
         """
         Args:
             root : the main tkinter root window (from TimerGUI).
                 Needed to schedule callbacks safely on the main thread.
+            force_threshold : Newtons — shown as a reference line on the
+                force graph and used to label the crossing count passed to
+                show_force_result_threadsafe(). Purely cosmetic here — the
+                actual crossing count is computed by whoever calls it
+                (ForceOrientationTracker, using config.py's FORCE_THRESHOLD_N).
+            force_popup_show_ms/force_popup_margin_x/force_popup_margin_y :
+                how long the force/orientation result popup stays up, and
+                its offset from each monitor's top-left corner. Defaults to
+                this module's FORCE_POPUP_SHOW_MS / 20px / 20px if not given
+                — pass config.py's FORCE_POPUP_SHOW_SEC*1000 /
+                FORCE_POPUP_MARGIN_X / FORCE_POPUP_MARGIN_Y to make them
+                tunable from the one config file.
         """
         self._root       = root
+        self.force_threshold = force_threshold
+        self.force_popup_show_ms = (
+            force_popup_show_ms if force_popup_show_ms is not None else FORCE_POPUP_SHOW_MS)
+        self.force_popup_margin_x = (
+            force_popup_margin_x if force_popup_margin_x is not None else 20)
+        self.force_popup_margin_y = (
+            force_popup_margin_y if force_popup_margin_y is not None else 20)
         self._win        = None
         self._start_time = None
         self._running    = False
@@ -94,13 +116,17 @@ class TrialPopup:
         """Call from Arduino thread when PEG PLACED is detected."""
         self._root.after(0, self._complete)
 
-    def show_force_result_threadsafe(self, trial_num, times, forces, peak, mean,
+    def show_force_result_threadsafe(self, trial_num, times, forces, peak, crossings,
                                       orientation_deg=None, orientation_ok=None,
                                       down_color=None, success=None):
         """Call from Arduino thread when 'Object returned successfully.' is detected.
 
         times/forces: parallel lists — elapsed seconds since trial start, and
         the ATI sensor's total force magnitude ‖F‖ (N) at that instant.
+        crossings: number of times the (smoothed) force rose above
+        self.force_threshold during the trial — a count of contact events,
+        not an average (which isn't meaningful for a signal that's mostly
+        near zero with occasional contact spikes).
         orientation_deg/orientation_ok: optional cylinder orientation angle (0° = upright)
         and whether it was within tolerance, measured at the "Target hit" event mid-trial.
         down_color: "blue" or "white" — whichever color was facing down at that same moment.
@@ -109,7 +135,7 @@ class TrialPopup:
         Pass None for all four if no orientation reading is available for this trial.
         """
         self._root.after(0, lambda: self._show_force_result(
-            trial_num, times, forces, peak, mean, orientation_deg, orientation_ok,
+            trial_num, times, forces, peak, crossings, orientation_deg, orientation_ok,
             down_color, success))
 
     # ── Score summary (call at end of session) ────────────────────────────────
@@ -396,10 +422,10 @@ class TrialPopup:
         # Auto-hide after POPUP_SHOW_MS
         self._root.after(POPUP_SHOW_MS, self._hide)
 
-    def _show_force_result(self, trial_num, times, forces, peak, mean,
+    def _show_force_result(self, trial_num, times, forces, peak, crossings,
                             orientation_deg=None, orientation_ok=None,
                             down_color=None, success=None):
-        """Replace the progress popup with a force-vs-time graph + peak/mean, on all monitors."""
+        """Replace the progress popup with a force-vs-time graph + peak/crossing count, on all monitors."""
         self._running = False
         self._hide()
 
@@ -408,20 +434,20 @@ class TrialPopup:
             {'name': 'DP-0',   'x': 640,  'y': 0, 'width': 640,  'height': 480},
             {'name': 'DP-2',   'x': 0,    'y': 0, 'width': 640,  'height': 480},
         ]
-        MARGIN_X = 20
-        MARGIN_Y = 20
 
         self._wins = []
         for monitor in monitors:
             win = self._create_force_popup_window(
-                x=monitor['x'] + MARGIN_X, y=monitor['y'] + MARGIN_Y,
-                trial_num=trial_num, times=times, forces=forces, peak=peak, mean=mean,
+                x=monitor['x'] + self.force_popup_margin_x,
+                y=monitor['y'] + self.force_popup_margin_y,
+                trial_num=trial_num, times=times, forces=forces, peak=peak, crossings=crossings,
                 orientation_deg=orientation_deg, orientation_ok=orientation_ok,
                 down_color=down_color, success=success
             )
             self._wins.append(win)
 
-        print(f"\n[Trial {trial_num}] Peak force: {peak:.2f} N  |  Mean force: {mean:.2f} N")
+        print(f"\n[Trial {trial_num}] Peak force: {peak:.2f} N  |  "
+              f"Crossed {self.force_threshold:.1f}N: {crossings}x")
         if orientation_deg is not None:
             print(f"[Trial {trial_num}] Orientation: {'OK' if orientation_ok else 'OFF'} "
                   f"({orientation_deg:+.1f}°)  —  {down_color} facing down")
@@ -435,12 +461,12 @@ class TrialPopup:
             print(f"[Score] Color-match success rate: "
                   f"{self.color_success_count}/{self.color_checked_count} ({rate:.1f}%)")
 
-        self._root.after(FORCE_POPUP_SHOW_MS, self._hide)
+        self._root.after(self.force_popup_show_ms, self._hide)
 
-    def _create_force_popup_window(self, x, y, trial_num, times, forces, peak, mean,
+    def _create_force_popup_window(self, x, y, trial_num, times, forces, peak, crossings,
                                     orientation_deg=None, orientation_ok=None,
                                     down_color=None, success=None):
-        """Helper to build one force-result popup (title + peak/mean + orientation + graph)."""
+        """Helper to build one force-result popup (title + peak/crossings + orientation + graph)."""
         win = tk.Toplevel(self._root)
         win.title("")
         win.configure(bg=COLORS['bg'])
@@ -462,7 +488,7 @@ class TrialPopup:
         title.pack(anchor='w')
 
         stats = tk.Label(
-            inner, text=f"Peak: {peak:.2f} N     Mean: {mean:.2f} N",
+            inner, text=f"Peak: {peak:.2f} N     Over {self.force_threshold:.1f}N: {crossings}x",
             font=("Arial", 11, "bold"), fg=COLORS['text_done'], bg=COLORS['bg']
         )
         stats.pack(anchor='w', pady=(2, 2))
@@ -486,6 +512,9 @@ class TrialPopup:
         fig.patch.set_facecolor(COLORS['bg'])
         ax = fig.add_subplot(111)
         ax.set_facecolor(COLORS['bg'])
+        ax.set_ylim(FORCE_PLOT_YMIN, FORCE_PLOT_YMAX)
+        ax.axhline(self.force_threshold, color=COLORS['force_peak'],
+                   linewidth=1, linestyle='--', alpha=0.6, zorder=1)
 
         if times:
             ax.plot(times, forces, color=COLORS['force_line'], linewidth=1.8)

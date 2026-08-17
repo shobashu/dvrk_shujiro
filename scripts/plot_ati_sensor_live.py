@@ -10,6 +10,7 @@ Usage:
     python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv
     python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv --window 10
     python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv --max-force 8
+    python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv --smooth 5 --y-max 10
 """
 
 import argparse
@@ -30,6 +31,10 @@ def parse_args():
     p.add_argument("--window",    type=float, default=10.0, help="Visible time window in seconds (default 10)")
     p.add_argument("--rate",      type=int,   default=20,   help="Refresh rate in Hz (default 20)")
     p.add_argument("--max-force", type=float, default=5.0,  help="Force value (N) that maps to full red (default 5)")
+    p.add_argument("--smooth",    type=int,   default=5,
+                   help="Trailing moving-average window (samples) to reduce sensor noise, "
+                        "1 = no smoothing (default 5)")
+    p.add_argument("--y-max",     type=float, default=10.0, help="Fixed y-axis upper limit in Newtons (default 10)")
     return p.parse_args()
 
 
@@ -96,6 +101,11 @@ def main():
             df["fy"].values[mask] ** 2 +
             df["fz"].values[mask] ** 2
         )
+        if args.smooth > 1 and mag.size:
+            # Trailing moving average — smooths sensor/electrical noise.
+            # min_periods=1 so the window fills in gradually at the start
+            # instead of producing NaNs.
+            mag = pd.Series(mag).rolling(window=args.smooth, min_periods=1).mean().values
 
         if mag.size > 1:
             segs = make_segments(tv, mag)
@@ -103,9 +113,7 @@ def main():
             lc.set_array(mag[:-1])
 
         ax.set_xlim(t_min, now)
-        if mag.size:
-            pad = max(mag.max() * 0.15, 0.5)
-            ax.set_ylim(0, max(mag.max() + pad, args.max_force * 1.1))
+        ax.set_ylim(0, args.y_max)
 
         current_mag = mag[-1] if mag.size else 0.0
         color = cmap(norm(current_mag))
