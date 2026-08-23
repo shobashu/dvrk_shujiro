@@ -43,7 +43,7 @@ class ForceOrientationTracker:
                  orientation_max_attempts, orientation_retry_delay_sec,
                  peg_classifications, csv_path, trial_signal_path,
                  on_force_result, logger=None, smoothing_window=1,
-                 force_threshold=5.0):
+                 force_threshold=5.0, timing_log_path=None, timing_config=None):
         """
         end_mode : same value as ArduinoTrigger's end_mode — "target_placed"
             stops force capture and shows the result popup right at
@@ -115,6 +115,27 @@ class ForceOrientationTracker:
                                     'Orientation_Deg', 'Orientation_OK', 'Down_Color',
                                     'Placement_Success'])
         self._signal_file = open(trial_signal_path, 'w')  # fresh each run
+
+        # ── Measured-latency log (orientation-check delay, force-popup delay) ──
+        self._timing_lock = threading.Lock()
+        self._timing_log_writer = None
+        if timing_log_path:
+            is_new = not os.path.exists(timing_log_path) or os.path.getsize(timing_log_path) == 0
+            self._timing_log_file = open(timing_log_path, mode='a', newline='')
+            self._timing_log_writer = csv.writer(self._timing_log_file)
+            if is_new:
+                self._timing_log_writer.writerow([
+                    'trial', 'event', 'config', 'total_latency_s',
+                    'settle_delay_s', 'inference_time_s', 'retries', 'unix_time'])
+        # "config" label so force-alone / orientation-alone / both-together
+        # (and now state-detection, tagged from outside since this class
+        # doesn't know about it) runs can be told apart without needing
+        # separate log files. Caller (TaskTimerNode) passes the combined
+        # label reflecting every capability active this session; falls back
+        # to just this tracker's own two flags if not given.
+        self._timing_config = timing_config if timing_config is not None else (
+            '+'.join(name for name, on in
+                      [('force', enable_force), ('orientation', enable_orientation)] if on) or 'none')
 
         # ── Trial-parsing state (mirrors read_arduino_with_force.py) ───────
         self._python_sync_time = 0
@@ -200,6 +221,28 @@ class ForceOrientationTracker:
                 below = True
         return count
 
+    def _log_timing(self, event, total_latency_s, settle_delay_s='', inference_time_s='', retries=''):
+        """Append one measured-latency row. Thread-safe — orientation-check
+        rows are written from the Arduino thread, force-popup rows from the
+        Tk thread (via log_popup_delay), potentially close together."""
+        if self._timing_log_writer is None:
+            return
+        with self._timing_lock:
+            self._timing_log_writer.writerow([
+                self.current_trial or '?', event, self._timing_config,
+                f'{total_latency_s:.4f}',
+                f'{settle_delay_s:.4f}' if settle_delay_s != '' else '',
+                f'{inference_time_s:.4f}' if inference_time_s != '' else '',
+                retries, f'{time.time():.3f}'])
+            self._timing_log_file.flush()
+
+    def log_popup_delay(self, trial, delay_s):
+        """Called from TrialPopup (Tk thread) once the force/orientation
+        popup actually starts rendering — measures the real thread-hop +
+        Tk-scheduling delay after the trigger event, instead of assuming
+        it's instant."""
+        self._log_timing('force_popup', total_latency_s=delay_s)
+
     def _stop_force_if_needed(self):
         """Stop force capture (if enabled). Called once, at whichever serial
         line matches self.end_mode."""
@@ -217,7 +260,8 @@ class ForceOrientationTracker:
         angle_deg, is_upright, down_color, success = self.last_orientation
         if self.on_force_result:
             self.on_force_result(self.current_trial or '?', times, forces, peak, crossings,
-                                  angle_deg, is_upright, down_color, success)
+                                  angle_deg, is_upright, down_color, success,
+                                  report_fired_at=time.time())
 
     def _maybe_report_or_wait(self):
         """Called once self.end_mode's trigger event happens. Reports right
@@ -239,13 +283,17 @@ class ForceOrientationTracker:
     def _check_orientation(self, side):
         """Crop the latest left-camera frame to `side` ("L"/"R"), run YOLO + orientation.
 
-        Returns (angle_deg, is_upright, down_color), or (None, None, None) if
-        no frame/cylinder is available.
+        Returns (angle_deg, is_upright, down_color, inference_time_s), where
+        the first three are None if no frame/cylinder is available.
+        inference_time_s measures this call's actual processing time (YOLO
+        detect + crop + compute_orientation) — the "processing" component of
+        the orientation-check delay, as opposed to the fixed settle delay.
         """
+        t0 = time.time()
         with self._frame_lock:
             frame = self._frame
         if frame is None:
-            return None, None, None
+            return None, None, None, time.time() - t0
 
         h, w = frame.shape[:2]
         crop = frame[:, :int(w * 0.4)] if side == 'L' else frame[:, int(w * 0.55):]
@@ -253,7 +301,7 @@ class ForceOrientationTracker:
         results = self.model.predict(
             crop, conf=self.yolo_conf, imgsz=self.yolo_imgsz, classes=[0], verbose=False)[0]
         if results.boxes is None or len(results.boxes) == 0:
-            return None, None, None
+            return None, None, None, time.time() - t0
 
         ch, cw = crop.shape[:2]
         x1, y1, x2, y2 = map(int, results.boxes[0].xyxy[0])
@@ -261,14 +309,15 @@ class ForceOrientationTracker:
         x2, y2 = min(cw, x2), min(ch, y2)
         sub = crop[y1:y2, x1:x2]
         if sub.size == 0:
-            return None, None, None
+            return None, None, None, time.time() - t0
 
         angle_deg, blue_c, white_c, _ = self._compute_orientation(sub)
         if white_c is None or blue_c is None:
-            return None, None, None
+            return None, None, None, time.time() - t0
 
         down_color = 'blue' if blue_c[1] > white_c[1] else 'white'
-        return angle_deg, abs(angle_deg) <= self.orientation_tolerance_deg, down_color
+        return (angle_deg, abs(angle_deg) <= self.orientation_tolerance_deg, down_color,
+                time.time() - t0)
 
     # ── Driven by ArduinoTrigger ────────────────────────────────────────────
 
@@ -283,7 +332,9 @@ class ForceOrientationTracker:
         side = self.pending_orientation['side']
         target_color = self.pending_orientation['target_color']
         attempt = self.pending_orientation['attempt']
-        angle_deg, is_upright, down_color = self._check_orientation(side)
+        angle_deg, is_upright, down_color, infer_s = self._check_orientation(side)
+        self.pending_orientation['inference_time_total'] = (
+            self.pending_orientation.get('inference_time_total', 0.0) + infer_s)
 
         if angle_deg is None and attempt < self.orientation_max_attempts:
             self._log(f'[ORIENTATION] no cylinder detected in crop '
@@ -292,11 +343,19 @@ class ForceOrientationTracker:
             self.pending_orientation['next_check'] = time.time() + self.orientation_retry_delay_sec
             return
 
+        triggered_at = self.pending_orientation['triggered_at']
+        inference_time_total = self.pending_orientation['inference_time_total']
+        retries_used = attempt - 1
         self.pending_orientation = None
         success = None
         if down_color is not None and target_color is not None:
             success = down_color.lower() == target_color.lower()
         self.last_orientation = (angle_deg, is_upright, down_color, success)
+
+        total_latency = time.time() - triggered_at
+        self._log_timing('orientation_check', total_latency_s=total_latency,
+                          settle_delay_s=self.orientation_delay_sec,
+                          inference_time_s=inference_time_total, retries=retries_used)
 
         if angle_deg is not None:
             if success is True:
@@ -307,9 +366,12 @@ class ForceOrientationTracker:
                 result_word = 'UNKNOWN — no target color captured for this trial'
             self._log(f'[ORIENTATION] {angle_deg:+.1f}°  ({"OK" if is_upright else "OFF"})  '
                       f'{down_color} facing down  —  target was {target_color}  '
-                      f'({result_word})')
+                      f'({result_word})  —  latency {total_latency:.2f}s '
+                      f'(settle {self.orientation_delay_sec:.1f}s + inference {inference_time_total:.3f}s'
+                      f'{f" + {retries_used} retries" if retries_used else ""})')
         else:
-            self._log(f'[ORIENTATION] no cylinder detected in crop after {attempt} attempts')
+            self._log(f'[ORIENTATION] no cylinder detected in crop after {attempt} attempts '
+                      f'(latency {total_latency:.2f}s)')
 
         if self._report_pending:
             self._report_pending = False
@@ -359,6 +421,8 @@ class ForceOrientationTracker:
                         'side': side,
                         'target_color': self.current_target_color,
                         'attempt': 1,
+                        'triggered_at': time.time(),
+                        'inference_time_total': 0.0,
                     }
             if self.end_mode == 'target_placed':
                 # The graph/popup covers only lift->place, matching what the

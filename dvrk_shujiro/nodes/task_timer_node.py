@@ -32,6 +32,19 @@ class TaskTimerNode(Node):
         self.enable_orientation_check = (
             settings.get('enable_orientation_check', ENABLE_ORIENTATION_CHECK)
             and self.trigger_source == 'arduino')
+        # Cylinder state detection (STATIONARY/HELD/DROPPED/LOST) only needs
+        # the camera + PSM1 pose — both already available regardless of
+        # trigger_source — so unlike the two above, it's not Arduino-only.
+        self.enable_state_detection = settings.get('enable_state_detection', ENABLE_STATE_DETECTION)
+
+        # One combined label so every measured-latency row this session —
+        # from either tracker — is tagged consistently (see
+        # scripts/9_analyze_timing.py).
+        self._timing_config = '+'.join(
+            name for name, on in [('force', self.enable_force_sensor),
+                                   ('orientation', self.enable_orientation_check),
+                                   ('state', self.enable_state_detection)] if on
+        ) or 'none'
 
         # State
         self.teleop_active = False
@@ -58,6 +71,7 @@ class TaskTimerNode(Node):
         self.arduino = None
         self.force_tracker = None
         self.force_popup = None
+        self.state_tracker = None
         if self.trigger_source == 'arduino':
             arduino_end_mode = settings.get('arduino_end_mode', ARDUINO_END_MODE)
 
@@ -84,15 +98,15 @@ class TaskTimerNode(Node):
                     peg_classifications=PEG_CLASSIFICATIONS,
                     csv_path=FORCE_ORIENTATION_CSV, trial_signal_path=TRIAL_SIGNAL_PATH,
                     on_force_result=self._on_force_result, logger=self.get_logger(),
-                    smoothing_window=FORCE_SMOOTHING_WINDOW, force_threshold=FORCE_THRESHOLD_N)
+                    smoothing_window=FORCE_SMOOTHING_WINDOW, force_threshold=FORCE_THRESHOLD_N,
+                    timing_log_path=TIMING_LOG_CSV, timing_config=self._timing_config)
+                # Wire the popup's measured-render-delay callback into the
+                # tracker's timing log now that both exist.
+                self.force_popup.on_popup_shown = self.force_tracker.log_popup_delay
 
                 if self.enable_force_sensor:
                     self.wrench_sub = self.create_subscription(
                         WrenchStamped, TOPIC_WRENCH, self._on_wrench, 50)
-                if self.enable_orientation_check:
-                    self.camera_sub = self.create_subscription(
-                        CompressedImage, TOPIC_CAMERA_LEFT, self._on_camera_frame,
-                        QoSPresetProfiles.SENSOR_DATA.value)
 
             self.arduino = ArduinoTrigger(
                 port=ARDUINO_PORT, baud=ARDUINO_BAUD, end_mode=arduino_end_mode,
@@ -108,6 +122,23 @@ class TaskTimerNode(Node):
 
             self.mono_sub = self.create_subscription(
                 Joy, TOPIC_OPERATOR_PRESENT, self.mono_callback, 10)
+
+        if self.enable_state_detection:
+            from ..state_detection.cylinder_state_tracker import CylinderStateTracker
+            self.state_tracker = CylinderStateTracker(
+                yolo_weights=YOLO_WEIGHTS, yolo_conf=YOLO_CONF, yolo_imgsz=YOLO_IMGSZ,
+                xgb_model_path=STATE_XGB_MODEL_PATH, xgb_window=STATE_XGB_WINDOW,
+                vel_window=STATE_VEL_WINDOW, max_jump=STATE_MAX_JUMP,
+                lost_frames=STATE_LOST_FRAMES, logger=self.get_logger(),
+                timing_log_path=TIMING_LOG_CSV, timing_config=self._timing_config,
+                on_state_change=self._on_cylinder_state_change)
+
+        # One shared camera subscription feeds whichever of the two YOLO-
+        # based trackers is active, regardless of trigger_source.
+        if self.enable_orientation_check or self.enable_state_detection:
+            self.camera_sub = self.create_subscription(
+                CompressedImage, TOPIC_CAMERA_LEFT, self._on_camera_frame,
+                QoSPresetProfiles.SENSOR_DATA.value)
 
         self.timer = self.create_timer(TIMER_INTERVAL, self.update_timer)
         self.gui.on_timeout = self._handle_timeout
@@ -135,6 +166,11 @@ class TaskTimerNode(Node):
         self.update_state()
     
     def pose_callback_psm1(self, msg):
+        if self.state_tracker:
+            # Runs continuously, independent of whether a trial is active —
+            # cylinder state isn't a trial-scoped concept.
+            self.state_tracker.on_psm1_pose(msg)
+
         if not self.gui.is_running:
             self.tracker_psm1.last_position = None
             self.tracker_psm1.last_orientation = None
@@ -214,16 +250,27 @@ class TaskTimerNode(Node):
     def _on_wrench(self, msg):
         self.force_tracker.on_wrench(msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z)
 
+    def _on_cylinder_state_change(self, old_state, new_state):
+        # Fires on CylinderStateTracker's background inference thread. Just a
+        # plain attribute write — same lock-free pattern the rest of the GUI
+        # metrics already use; TimerGUI reads it on the Tk thread every 100ms.
+        self.gui.cylinder_state = new_state
+
     def _on_camera_frame(self, msg):
-        self.force_tracker.on_compressed_image(msg.data)
+        # Shared subscription — route to whichever tracker(s) actually need it.
+        if self.force_tracker:
+            self.force_tracker.on_compressed_image(msg.data)
+        if self.state_tracker:
+            self.state_tracker.on_compressed_image(msg.data)
 
     def _on_force_result(self, trial, times, forces, peak, crossings,
-                          angle_deg, is_upright, down_color, success):
+                          angle_deg, is_upright, down_color, success, report_fired_at=None):
         """Called (from the Arduino thread) once a trial's full lift->place->
         return cycle is done — independent of when the trial timer itself
         ended if ARDUINO_END_MODE is 'target_placed'."""
         self.force_popup.show_force_result_threadsafe(
-            trial, times, forces, peak, crossings, angle_deg, is_upright, down_color, success)
+            trial, times, forces, peak, crossings, angle_deg, is_upright, down_color, success,
+            report_fired_at=report_fired_at)
 
     def update_timer(self):
         self.gui.tick(TIMER_INTERVAL)

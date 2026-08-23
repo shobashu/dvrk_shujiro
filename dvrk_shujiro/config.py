@@ -114,6 +114,30 @@ FORCE_POPUP_MARGIN_Y = 100    # offset (pixels) from each monitor's TOP edge
 
 FORCE_ORIENTATION_CSV = "force_orientation_data.csv"
 
+# Measured (not assumed) latency log — one row per orientation-check, per
+# force-popup, and per state-detection event, tagged with which capabilities
+# were enabled that run so "force+orientation together" vs "orientation
+# alone" (etc.) can be compared later. See scripts/9_analyze_timing.py.
+TIMING_LOG_CSV = "timing_log.csv"
+
+# ── Cylinder state detection (STATIONARY/HELD/DROPPED/LOST) ────────────────
+# Independent of TRIGGER_SOURCE — only needs /camera_left/compressed and
+# /PSM1/measured_cp, both already used regardless of trigger. Always uses
+# the trained XGBoost classifier (see scripts/7_2_train_xgboost.py) — no
+# rule-based fallback. LOST is still a deterministic "not detected for
+# STATE_LOST_FRAMES frames" rule, never model-predicted — see
+# state_detection/cylinder_state_tracker.py for why (same reasoning as the
+# fix in scripts/7_velocity_check.py).
+ENABLE_STATE_DETECTION = False
+
+# Trained model to load — retrain with scripts/7_2_train_xgboost.py and
+# point this at the new file when you have a better one.
+STATE_XGB_MODEL_PATH = SCRIPTS_DIR + '/models/cylinder_state_xgb_v2.json'
+STATE_XGB_WINDOW = 5          # lag window — MUST match the value used to train STATE_XGB_MODEL_PATH
+STATE_VEL_WINDOW = 5          # rolling-average window (frames) for velocity smoothing
+STATE_MAX_JUMP = 800.0        # px/s — reject detections implying an impossible jump (spurious/misdetection)
+STATE_LOST_FRAMES = 10        # consecutive missed detections before -> LOST
+
 # Cross-process signal file for scripts/depth_camera/09_live_trial_monitor.py
 # (only relevant if you also run that script) — see read_arduino_with_force.py
 # module docstring for why this exists.

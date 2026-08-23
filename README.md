@@ -326,6 +326,78 @@ dvrk_shujiro/
 
 ---
 
+## Code Map (by topic — useful for methods/thesis writing)
+
+Which files to read (or upload) for each part of a write-up, **in call
+order** (who calls whom), not alphabetically. `dvrk_shujiro/config.py`
+underlies every section below — nearly every tunable constant referenced
+anywhere in this codebase lives there in one place. Files under `archive/`
+or the various standalone `arduino/read_arduino_*.py` scripts are **not**
+part of the live pipeline described here (see their own docstrings) — this
+map only covers what `python3 -m dvrk_shujiro.main` actually runs.
+
+### Pipeline overview / system architecture
+```
+main.py                                    entry point
+  ├─ config.py                             every tunable constant
+  ├─ gui/timer_window.py    → TimerGUI     the two floating timer windows
+  └─ nodes/task_timer_node.py → TaskTimerNode
+                                            orchestrates everything below;
+                                            owns the trial state machine
+```
+`main.py` prompts for session settings, creates the GUI, creates the ROS
+node, spins ROS on a background thread while Tkinter owns the main thread
+(see `CLAUDE.md`'s Architecture section for the two-thread rationale).
+
+### Realtime GUI & trial clock
+```
+gui/timer_window.py → TimerGUI / TimerWindow
+    dual-window display, 100ms refresh, progress bar, timeout->fail logic
+nodes/task_timer_node.py → TaskTimerNode
+    update_state()                     MONO+teleop trigger
+    _arduino_start() / _arduino_end()  Arduino trigger
+    update_timer()                     200Hz ROS timer, drives gui.tick()
+    _log_periodic_update() / _log_trial_results()   terminal reporting
+```
+
+### Path length
+```
+nodes/task_timer_node.py → pose_callback_psm1() / pose_callback_psm2()
+    feeds each /PSM{1,2}/measured_cp sample into:
+metrics/metrics_tracker.py → MetricsTracker.update_position()
+    cumulative Euclidean distance between consecutive samples
+```
+
+### Rate of orientation change
+```
+nodes/task_timer_node.py → pose_callback_psm1() / pose_callback_psm2()
+    feeds each sample's orientation quaternion into:
+metrics/metrics_tracker.py → MetricsTracker.update_orientation()
+    calls:
+utils/quaternion_math.py → quaternion_conjugate() / quaternion_multiply() / quaternion_to_angle()
+    the actual math: relative rotation between consecutive samples
+```
+
+### Ground contact detection (force sensor)
+```
+scripts/ati_sensor_udp_receiver.py
+    hardware bridge: UDP packets from the ATI F/T sensor -> /ati_sensor/wrench
+arduino/arduino_bridge.py → ArduinoTrigger
+    owns the one serial connection to the Arduino peg board; dispatches
+    every raw line to force_orientation_bridge.py via on_raw_line()/on_poll()
+arduino/force_orientation_bridge.py → ForceOrientationTracker
+    on_wrench()          buffers ||F|| samples while a trial is active
+    _smooth()            moving-average noise filter (FORCE_SMOOTHING_WINDOW)
+    _count_crossings()   the actual "ground contact" detection logic --
+                          rising-edge crossings above FORCE_THRESHOLD_N
+    (if orientation check enabled) dynamically loads
+    scripts/6_cylinder_orientation.py, calls YOLO + compute_orientation()
+gui/trial_popup.py → TrialPopup
+    displays the force graph + threshold reference line + crossing count
+```
+
+---
+
 ## Hardware
 
 - **Robot:** da Vinci Si surgical system (dVRK modified)
@@ -362,40 +434,6 @@ sudo apt install \
   ffmpeg \
   vlc
 ```
-
----
-
-## Development Roadmap
-
-### ✅ Phase 1: Camera System (Complete)
-- [x] Camera streaming at 30 fps
-- [x] Compressed recording pipeline
-- [x] Bag-to-video conversion
-- [x] Performance optimization
-
-### ✅ Phase 2: Task Metrics (Complete)
-- [x] Task timer GUI
-- [x] Path length tracking
-- [x] Active time measurement
-- [x] Visual feedback
-
-### 🔄 Phase 3: Kinematics Analysis (In Progress)
-- [ ] Smoothness metrics
-- [ ] Path efficiency
-- [ ] Tremor detection
-- [ ] Workspace violations
-
-### 📋 Phase 4: Vision ML (Next)
-- [ ] YOLO integration for tool detection
-- [ ] DeepLabCut for pose estimation
-- [ ] Real-time inference pipeline
-- [ ] Stereo 3D reconstruction
-
-### 📋 Phase 5: Assessment System
-- [ ] Multimodal scoring engine
-- [ ] Real-time feedback
-- [ ] Performance visualization
-- [ ] Data analysis tools
 
 ---
 
@@ -465,13 +503,6 @@ saves to `~/dvrk_recordings/training/`. See
 ├── trial_01_compressed_right.mp4
 └── ...
 ```
-
----
-
-## Session History
-
-- **2026-03-23:** Initial camera setup, brightness troubleshooting
-- **2026-03-31:** Optimized to 30 fps, compressed recording system
 
 ---
 

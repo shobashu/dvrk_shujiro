@@ -15,11 +15,16 @@ Run with:
 
 On launch it prompts for the session settings (Enter accepts the
 config.py default for each — see TRIGGER_SOURCE / ARDUINO_END_MODE /
-TRACK_PATH_LENGTH / TRACK_ORIENTATION / ENABLE_FORCE_SENSOR /
-ENABLE_ORIENTATION_CHECK in config.py to change the defaults):
+TRACK_PATH_LENGTH / TRACK_ORIENTATION / ENABLE_STATE_DETECTION /
+ENABLE_FORCE_SENSOR / ENABLE_ORIENTATION_CHECK in config.py to change
+the defaults):
     - Trial trigger: MONO pedal + teleop, or Arduino cylinder lift/place
     - (if Arduino) trial end: placed on target peg, or placed + returned to center
     - whether to report path length / angular displacement & orientation rate
+    - whether to enable cylinder state detection (STATIONARY/HELD/DROPPED/
+      LOST via a trained XGBoost model — see scripts/7_2_train_xgboost.py
+      and scripts/7_velocity_check.py, which this is a headless port of;
+      needs the camera stream + YOLO venv, but NOT the Arduino trigger)
     - (if Arduino) whether to enable ATI force capture (needs the ATI UDP
       receiver running)
     - (if Arduino) whether to enable the YOLO cylinder-orientation check
@@ -55,7 +60,7 @@ import rclpy
 from .config import (
     MAX_TIME_SEC, TRIGGER_SOURCE, ARDUINO_END_MODE,
     TRACK_PATH_LENGTH, TRACK_ORIENTATION,
-    ENABLE_FORCE_SENSOR, ENABLE_ORIENTATION_CHECK,
+    ENABLE_FORCE_SENSOR, ENABLE_ORIENTATION_CHECK, ENABLE_STATE_DETECTION,
 )
 from .gui.timer_window import TimerGUI
 from .nodes.task_timer_node import TaskTimerNode
@@ -105,30 +110,31 @@ def prompt_session_settings():
     track_path = _prompt_bool('Report path length?', TRACK_PATH_LENGTH)
     track_orientation = _prompt_bool('Report angular displacement / orientation rate?', TRACK_ORIENTATION)
 
+    # Independent of trigger_source — only needs the camera + PSM1 pose,
+    # both already available in either mode.
+    enable_state_detection = _prompt_bool(
+        'Enable cylinder state detection (STATIONARY/HELD/DROPPED/LOST)?',
+        ENABLE_STATE_DETECTION)
+
     enable_force_sensor = False
     enable_orientation_check = False
     if trigger_source == 'arduino':
-        enable_force_sensor = _prompt_bool(
-            'Enable force sensor? (peak force + threshold-crossing count per trial — '
-            'needs the ATI UDP receiver running)',
-            ENABLE_FORCE_SENSOR)
-        enable_orientation_check = _prompt_bool(
-            'Enable YOLO cylinder-orientation check? (needs the camera stream running AND this '
-            'terminal to be in the YOLO venv)',
-            ENABLE_ORIENTATION_CHECK)
+        enable_force_sensor = _prompt_bool('Enable force sensor?', ENABLE_FORCE_SENSOR)
+        enable_orientation_check = _prompt_bool('Enable YOLO orientation check?', ENABLE_ORIENTATION_CHECK)
 
     print(f'-> trigger={trigger_source}'
           + (f', arduino_end_mode={arduino_end_mode}' if trigger_source == 'arduino' else '')
           + f', path_length={track_path}, orientation={track_orientation}'
+          + f', state_detection={enable_state_detection}'
           + (f', force_sensor={enable_force_sensor}, orientation_check={enable_orientation_check}'
              if trigger_source == 'arduino' else '')
           + '\n')
 
-    if enable_force_sensor or enable_orientation_check:
+    if enable_force_sensor or enable_orientation_check or enable_state_detection:
         print('Make sure these are already running before you continue:')
         if enable_force_sensor:
             print('  - python3 scripts/ati_sensor_udp_receiver.py        (publishes /ati_sensor/wrench)')
-        if enable_orientation_check:
+        if enable_orientation_check or enable_state_detection:
             print('  - ./scripts/camera-stream-compressed-transport.sh   (publishes /camera_left/compressed)')
             print('  - this terminal itself must be in the YOLO venv (source ~/ros2_yolo_venv/bin/activate)')
         print()
@@ -138,6 +144,7 @@ def prompt_session_settings():
         'arduino_end_mode': arduino_end_mode,
         'track_path': track_path,
         'track_orientation': track_orientation,
+        'enable_state_detection': enable_state_detection,
         'enable_force_sensor': enable_force_sensor,
         'enable_orientation_check': enable_orientation_check,
     }

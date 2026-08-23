@@ -96,6 +96,11 @@ class AtiSensorUdpReceiver(Node):
         self.wrench_pub.publish(msg)
 
         self.csv_writer.writerow([now, fx, fy, fz, tx, ty, tz])
+        # Flush every row: this file is read live by a *different* process
+        # (plot_ati_sensor_live.py) — without this, rows can sit in Python's
+        # internal write buffer for a while before another process can see
+        # them, adding to the live plot's measured data-age delay.
+        self.csv_file.flush()
 
     def destroy_node(self):
         try:

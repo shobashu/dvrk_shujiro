@@ -20,8 +20,18 @@ class TimerWindow:
         'green': '#1a3a0d',           # Dim green
         'orange': '#4a3510',          # Dim orange
         'red': '#3a0a0a',             # Dim red
-        'psm1': '#1a2a4a',            # Dim blue for PSM1
-        'psm2': '#4a1a2a',            # Dim pink for PSM2
+        'psm1': '#6ea8fe',            # Blue for PSM1 (R label) — bright, this is read-often text
+        'psm2': '#f48fb1',            # Pink for PSM2 (L label) — bright, this is read-often text
+    }
+
+    # Cylinder-state label colors — brighter than the dim theme above since
+    # this is an active signal to watch, not passive chrome.
+    STATE_COLORS = {
+        'STATIONARY': '#4caf50',
+        'HELD': '#64b5f6',
+        'DROPPED': '#ffb74d',
+        'LOST': '#e57373',
+        None: '#404040',
     }
     
     def __init__(self, title, is_left=True):
@@ -108,15 +118,31 @@ class TimerWindow:
         self.path_left.pack(side='left', padx=10)
         
         self.path_right = tk.Label(
-            path_frame, 
+            path_frame,
             text="R: 0 mm",
-            font=FONT_PATH, 
+            font=FONT_PATH,
             fg=self.COLORS['psm1'],
             bg=self.COLORS['bg']
         )
         self.path_right.pack(side='right', padx=10)
-    
-    def update(self, time_text, status_text, path1_mm, path2_mm, 
+
+        # Cylinder state (only meaningful when state detection is enabled;
+        # otherwise stays blank). Not trial-scoped — updates continuously.
+        self.state_label = tk.Label(
+            self.root,
+            text="",
+            font=FONT_PATH,
+            fg=self.COLORS['text_secondary'],
+            bg=self.COLORS['bg']
+        )
+        self.state_label.pack(pady=(0, 3))
+
+    def update_state(self, state):
+        """state: one of 'STATIONARY'/'HELD'/'DROPPED'/'LOST', or None."""
+        text = f"Cylinder: {state}" if state else ""
+        self.state_label.config(text=text, fg=self.STATE_COLORS.get(state, self.COLORS['text_secondary']))
+
+    def update(self, time_text, status_text, path1_mm, path2_mm,
               progress_pct, bar_color):
         """Update all display elements"""
         # Update status with dimmed color
@@ -163,7 +189,12 @@ class TimerGUI:
         self.angular_displacement_psm2 = 0.0
         self.orientation_rate_psm1 = 0.0
         self.orientation_rate_psm2 = 0.0
-        
+
+        # Written from the background YOLO-inference thread (CylinderStateTracker's
+        # on_state_change callback) — plain attribute, same lock-free pattern as
+        # the other metrics above; read here on the Tk thread every 100ms.
+        self.cylinder_state = None
+
         # Create windows
         self.window_left = TimerWindow("dVRK Timer", is_left=True)
         self.window_right = TimerWindow("dVRK Timer", is_left=False)
@@ -219,7 +250,12 @@ class TimerGUI:
         else:
             for window in [self.window_left, self.window_right]:
                 window.reset_display()
-        
+
+        # Cylinder state isn't trial-scoped, so it updates every tick
+        # regardless of is_running.
+        for window in [self.window_left, self.window_right]:
+            window.update_state(self.cylinder_state)
+
         self.window_left.root.after(100, self._update_display)
     
     def start(self):

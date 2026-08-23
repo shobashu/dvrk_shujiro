@@ -458,14 +458,17 @@ class CylinderVelocityNode(Node):
             self._prev_center = None
             self._prev_time   = None
             smoothed = self._vel_hist[-1] if self._vel_hist else 0.0
+            # LOST is a deterministic rule ("not detected for --lost frames"),
+            # not something to learn: there's no real detection here for the
+            # classifier to reason about, and the trained model is unreliable
+            # on this specific transition (near-zero recall on LOST in
+            # holdout testing — it almost always guesses HELD instead).
             if self._xgb_model is not None:
-                new_state = self._xgb_classify(smoothed, -1.0, -1.0)
-                if new_state is not None:
-                    self._set_state(new_state, 0.0, None)
-                elif self._lost_count >= self.lost_frames and self._state != STATE_LOST:
-                    self._set_state(STATE_LOST, 0.0, None)
-            elif (self._lost_count >= self.lost_frames
-                    and self._state != STATE_LOST):
+                # Still feed the lag buffer (cx=cy=-1, same convention as the
+                # logged training data) so it stays warmed up for when a real
+                # detection resumes — just ignore what it predicts here.
+                self._xgb_classify(smoothed, -1.0, -1.0)
+            if self._lost_count >= self.lost_frames and self._state != STATE_LOST:
                 self._set_state(STATE_LOST, 0.0, None)
             self._finish(out, None, smoothed, now)
             return out

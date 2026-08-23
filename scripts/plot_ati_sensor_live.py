@@ -6,6 +6,13 @@ ati_sensor_udp_receiver.py. No ROS2 required; works in any Python environment.
 The curve color transitions green → yellow → red as force increases toward
 --max-force. A colorbar on the right shows the scale.
 
+Measures (not assumes) its own display latency: every frame it computes
+data_age_s (how old the newest plotted sample already was when this frame
+drew it — receiver-write to plot-visible) and read_time_s (how long re-
+parsing the growing CSV took). Both are logged to --delay-log every frame,
+and a summary (mean/std/min/max) prints to the terminal when you close the
+plot window.
+
 Usage:
     python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv
     python3 plot_ati_sensor_live.py ati_sensor_20260603_120000.csv --window 10
@@ -14,6 +21,10 @@ Usage:
 """
 
 import argparse
+import csv
+import statistics
+import time
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -35,6 +46,9 @@ def parse_args():
                    help="Trailing moving-average window (samples) to reduce sensor noise, "
                         "1 = no smoothing (default 5)")
     p.add_argument("--y-max",     type=float, default=10.0, help="Fixed y-axis upper limit in Newtons (default 10)")
+    p.add_argument("--delay-log", default=None,
+                   help="Where to log measured data_age_s/read_time_s per frame "
+                        "(default: <csv>_delay_log.csv)")
     return p.parse_args()
 
 
@@ -55,6 +69,12 @@ def make_segments(x, y):
 
 def main():
     args = parse_args()
+
+    delay_log_path = args.delay_log or f"{Path(args.csv).stem}_delay_log.csv"
+    delay_log_file = open(delay_log_path, "w", newline="")
+    delay_log_writer = csv.writer(delay_log_file)
+    delay_log_writer.writerow(["unix_time", "data_age_s", "read_time_s", "row_count"])
+    delay_samples = {"data_age_s": [], "read_time_s": []}
 
     plt.rcParams.update({"font.size": 13})
 
@@ -86,9 +106,22 @@ def main():
     )
 
     def update(_frame):
+        read_t0 = time.time()
         df = read_csv_safe(args.csv)
+        read_time_s = time.time() - read_t0
         if df is None or df.empty:
             return [lc]
+
+        # Measured (not assumed) delay: how old was the newest sample,
+        # in wall-clock terms, by the time this frame actually drew it.
+        # timestamp_s is a raw time.time() value written by
+        # ati_sensor_udp_receiver.py, so this captures UDP-to-file-to-here
+        # end to end, including any file-buffering delay on the writer side.
+        data_age_s = time.time() - df["timestamp_s"].iloc[-1]
+        delay_samples["data_age_s"].append(data_age_s)
+        delay_samples["read_time_s"].append(read_time_s)
+        delay_log_writer.writerow([f"{time.time():.3f}", f"{data_age_s:.4f}",
+                                    f"{read_time_s:.4f}", len(df)])
 
         t = df["timestamp_s"].values - df["timestamp_s"].iloc[0]
         now = t[-1]
@@ -117,14 +150,31 @@ def main():
 
         current_mag = mag[-1] if mag.size else 0.0
         color = cmap(norm(current_mag))
-        mag_text.set_text(f"‖F‖ = {current_mag:.3f} N  |  t = {now:.1f} s")
+        mag_text.set_text(f"‖F‖ = {current_mag:.3f} N  |  t = {now:.1f} s  |  "
+                           f"data age = {data_age_s * 1000:.0f} ms")
         mag_text.set_color(color)
 
         return [lc]
 
+    def _print_summary(*_args):
+        def stats(name):
+            vals = delay_samples[name]
+            if not vals:
+                return f"  {name}: no samples"
+            return (f"  {name}: mean={statistics.mean(vals):.4f}s "
+                    f"± {statistics.pstdev(vals) if len(vals) > 1 else 0.0:.4f}s "
+                    f"(min {min(vals):.4f}s, max {max(vals):.4f}s, n={len(vals)})")
+        print(f"\n── Measured display latency (this session) ──")
+        print(stats("data_age_s"))
+        print(stats("read_time_s"))
+        print(f"  Log saved: {delay_log_path}")
+        delay_log_file.flush()
+        delay_log_file.close()
+
     interval_ms = int(1000 / args.rate)
     ani = animation.FuncAnimation(  # noqa: F841
         fig, update, interval=interval_ms, blit=False, cache_frame_data=False)
+    fig.canvas.mpl_connect("close_event", _print_summary)
 
     plt.tight_layout()
     plt.show()

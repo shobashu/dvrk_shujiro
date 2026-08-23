@@ -64,7 +64,8 @@ class TrialPopup:
     """
 
     def __init__(self, root, force_threshold=5.0,
-                 force_popup_show_ms=None, force_popup_margin_x=None, force_popup_margin_y=None):
+                 force_popup_show_ms=None, force_popup_margin_x=None, force_popup_margin_y=None,
+                 on_popup_shown=None):
         """
         Args:
             root : the main tkinter root window (from TimerGUI).
@@ -81,9 +82,14 @@ class TrialPopup:
                 — pass config.py's FORCE_POPUP_SHOW_SEC*1000 /
                 FORCE_POPUP_MARGIN_X / FORCE_POPUP_MARGIN_Y to make them
                 tunable from the one config file.
+            on_popup_shown : optional callback(trial_num, delay_s), called
+                from _show_force_result() once we know how long it actually
+                took (thread-hop + Tk scheduling) after the trigger event —
+                lets the caller log measured (not assumed) popup latency.
         """
         self._root       = root
         self.force_threshold = force_threshold
+        self.on_popup_shown = on_popup_shown
         self.force_popup_show_ms = (
             force_popup_show_ms if force_popup_show_ms is not None else FORCE_POPUP_SHOW_MS)
         self.force_popup_margin_x = (
@@ -118,7 +124,7 @@ class TrialPopup:
 
     def show_force_result_threadsafe(self, trial_num, times, forces, peak, crossings,
                                       orientation_deg=None, orientation_ok=None,
-                                      down_color=None, success=None):
+                                      down_color=None, success=None, report_fired_at=None):
         """Call from Arduino thread when 'Object returned successfully.' is detected.
 
         times/forces: parallel lists — elapsed seconds since trial start, and
@@ -133,10 +139,13 @@ class TrialPopup:
         success: whether down_color matched the trial's target color — the actual
         placement-correctness signal used for the running success rate.
         Pass None for all four if no orientation reading is available for this trial.
+        report_fired_at: time.time() from the caller's thread, right before
+        this call — used to measure (not assume) the delay until the popup
+        actually starts rendering, via on_popup_shown.
         """
         self._root.after(0, lambda: self._show_force_result(
             trial_num, times, forces, peak, crossings, orientation_deg, orientation_ok,
-            down_color, success))
+            down_color, success, report_fired_at))
 
     # ── Score summary (call at end of session) ────────────────────────────────
 
@@ -424,8 +433,14 @@ class TrialPopup:
 
     def _show_force_result(self, trial_num, times, forces, peak, crossings,
                             orientation_deg=None, orientation_ok=None,
-                            down_color=None, success=None):
+                            down_color=None, success=None, report_fired_at=None):
         """Replace the progress popup with a force-vs-time graph + peak/crossing count, on all monitors."""
+        if report_fired_at is not None:
+            popup_delay = time.time() - report_fired_at
+            print(f"[Trial {trial_num}] Popup rendering started {popup_delay:.3f}s after trial end")
+            if self.on_popup_shown:
+                self.on_popup_shown(trial_num, popup_delay)
+
         self._running = False
         self._hide()
 
